@@ -1,8 +1,8 @@
 """
-Servidor FastAPI para RAG Histología Neo4j — Fullstack A2UI
+Servidor FastAPI para RAG Histología Qdrant — Fullstack A2UI
 ============================================================
-Wrappea AsistenteHistologiaNeo4j y expone endpoints REST + A2UI.
-El módulo ne4j-histo.py se importa sin modificación.
+Wrappea AsistenteHistologiaQdrant y expone endpoints REST + A2UI.
+El módulo qdrant-histo.py se importa sin modificación.
 """
 
 import asyncio
@@ -26,25 +26,25 @@ from pydantic import BaseModel
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
-# ── Importar el módulo principal ─────────────────────────────────────
-# ne4j-histo.py tiene guión, así que lo importamos con importlib
+# ── Importar el módulo principal ─────────────────────────────────────────
+# qdrant-histo.py tiene guión, así que lo importamos con importlib
 import importlib.util
 
-_HISTO_PATH = Path(__file__).parent / "ne4j-histo.py"
-spec = importlib.util.spec_from_file_location("ne4j_histo", str(_HISTO_PATH))
-ne4j_histo = importlib.util.module_from_spec(spec)
+_HISTO_PATH = Path(__file__).parent / "qdrant-histo.py"
+spec = importlib.util.spec_from_file_location("qdrant_histo", str(_HISTO_PATH))
+qdrant_histo = importlib.util.module_from_spec(spec)
 
 # Prevenir que el módulo ejecute su __main__
 _original_argv = sys.argv
-sys.argv = ["ne4j-histo.py"]
-spec.loader.exec_module(ne4j_histo)
+sys.argv = ["qdrant-histo.py"]
+spec.loader.exec_module(qdrant_histo)
 sys.argv = _original_argv
 
-AsistenteHistologiaNeo4j = ne4j_histo.AsistenteHistologiaNeo4j
-DIRECTORIO_PDFS = ne4j_histo.DIRECTORIO_PDFS
+AsistenteHistologiaQdrant = qdrant_histo.AsistenteHistologiaQdrant
+DIRECTORIO_PDFS = qdrant_histo.DIRECTORIO_PDFS
 
-# ── Estado global ────────────────────────────────────────────────────
-asistente: Optional[AsistenteHistologiaNeo4j] = None
+# ── Estado global ────────────────────────────────────────────────
+asistente: Optional[AsistenteHistologiaQdrant] = None
 _init_complete = False
 _init_error: Optional[str] = None
 
@@ -68,10 +68,10 @@ class ChatResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global asistente, _init_complete, _init_error
-    print("🚀 Iniciando servidor RAG Histología Neo4j + A2UI...")
+    print("🚀 Iniciando servidor RAG Histología Qdrant + A2UI...")
 
     try:
-        asistente = AsistenteHistologiaNeo4j()
+        asistente = AsistenteHistologiaQdrant()
         await asistente.inicializar_componentes()
 
         print("📚 Leyendo PDFs...")
@@ -82,8 +82,8 @@ async def lifespan(app: FastAPI):
         n_temas = len(asistente.extractor_temario.temas) if asistente.extractor_temario else 0
         print(f"   → {n_temas} temas")
 
-        print("💾 Verificando e indexando base de datos Neo4j (si está vacía)...")
-        await asistente.indexar_en_neo4j(DIRECTORIO_PDFS, forzar=False)
+        print("💾 Verificando e indexando base de datos Qdrant (si está vacía)...")
+        await asistente.indexar_en_qdrant(DIRECTORIO_PDFS, forzar=False)
 
         _init_complete = True
         print("✅ Servidor listo")
@@ -103,9 +103,9 @@ async def lifespan(app: FastAPI):
 
 # ── App FastAPI ──────────────────────────────────────────────────────
 app = FastAPI(
-    title="RAG Histología Neo4j + A2UI",
+    title="RAG Histología Qdrant + A2UI",
     description="Sistema RAG Multimodal de Histología — Fullstack",
-    version="4.1.0",
+    version="5.0.0",
     lifespan=lifespan,
 )
 
@@ -206,7 +206,7 @@ async def post_chat(req: ChatRequest):
         trayectoria = []
         estructura = None
         imagenes_rec = []
-        trayectoria_file = Path(__file__).parent / "trayectoria_neo4j.json"
+        trayectoria_file = Path(__file__).parent / "trayectoria_qdrant.json"
         if trayectoria_file.exists():
             try:
                 with open(trayectoria_file, "r", encoding="utf-8") as f:

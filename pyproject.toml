@@ -1,11 +1,11 @@
 [project]
-name = "rag-histologia-neo4j"
-version = "4.1.0"
-description = "RAG Multimodal de Histología con ImageBind + Neo4j"
+name = "rag-histologia-qdrant"
+version = "5.0.0"
+description = "RAG Multimodal de Histología con Qdrant"
 requires-python = ">=3.10"
 dependencies = [
-    # Neo4j
-    "neo4j>=5.0",
+    # Qdrant
+    "qdrant-client>=1.17.0",
     "pdf2image>=1.16",
     "pytesseract>=0.3",
     # LangChain / LangGraph
@@ -34,7 +34,6 @@ dependencies = [
     "python-multipart>=0.0.6",
     "pymupdf>=1.27.1",
     "langchain-groq>=1.1.2",
-    "qdrant-client>=1.17.0",
 ]
 
 [tool.setuptools]

@@ -1,5 +1,5 @@
 # =============================================================================
-# RAG Multimodal de Histología con ImageBind + Neo4j — VERSIÓN 4.1
+# RAG Multimodal de Histología con Qdrant — VERSIÓN 5.0
 # =============================================================================
 # Cambios sobre v4.0:
 #   1. RAGAS eliminado completamente (clase MetricasRAGAS, imports, nodo
@@ -51,9 +51,9 @@ if HF_TOKEN:
 else:
     print("⚠️ HF_TOKEN no encontrado en .env (necesario para UNI)")
 
-# Neo4j
-from neo4j import AsyncGraphDatabase, AsyncDriver
-from neo4j.exceptions import ServiceUnavailable
+# Qdrant Cloud (vector store principal)
+from qdrant_client import models
+from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 
 import fitz # PyMuPDF
 from pdf2image import convert_from_path
@@ -92,12 +92,10 @@ DIM_IMG_PLIP     = 512
 DIRECTORIO_IMAGENES   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imagenes_extraidas")
 DIRECTORIO_PDFS       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf")
 
-# Índices Neo4j
-INDEX_TEXTO = "histo_text"      # Gemini Text
-INDEX_UNI   = "histo_img_uni"   # UNI Image
-INDEX_PLIP  = "histo_img_plip"  # PLIP Image
+# Colecciones Qdrant Cloud
+COLLECTION_CHUNKS   = "histo_chunks"       # Texto (Gemini)
+COLLECTION_IMAGENES = "histo_imagenes"     # Imágenes (UNI + PLIP)
 
-NEO4J_GRAPH_DEPTH     = 2
 SIMILAR_IMG_THRESHOLD = 0.85 # Más alto para modelos especializados
 
 FEATURES_DISCRIMINATORIAS = [
@@ -210,7 +208,7 @@ def setup_langsmith_environment():
         "LANGCHAIN_TRACING_V2": "true",
         "LANGCHAIN_API_KEY":    userdata.get("LANGSMITH_API_KEY"),
         "LANGCHAIN_ENDPOINT":   "https://api.smith.langchain.com",
-        "LANGCHAIN_PROJECT":    "rag_histologia_neo4j_v4"
+        "LANGCHAIN_PROJECT":    "q_histo"
     }
     for key, value in config.items():
         if value:
@@ -306,219 +304,176 @@ class UniWrapper:
 
 
 # =============================================================================
-# CLIENTE NEO4J (Adaptado para 3 índices)
+# VECTOR STORE QDRANT CLOUD (reemplaza Neo4j)
 # =============================================================================
 
-class Neo4jClient:
+class QdrantVectorStore:
     """
-    Wrapper async para Neo4j que encapsula:
-    - Conexión (AuraDB cloud o local)
-    - Creación del esquema de grafo y vector index
-    - Operaciones de escritura (indexación)
-    - Operaciones de lectura (búsqueda híbrida)
+    Wrapper para Qdrant Cloud que reemplaza a Neo4j.
+    Usa 2 colecciones:
+      - histo_chunks:   chunks de texto con embedding Gemini (3072)
+      - histo_imagenes: imágenes con embeddings UNI (1024) y PLIP (512)
+    Las entidades se almacenan como payload para filtrado.
     """
 
-    def __init__(self, uri: str, user: str, password: str):
-        self.uri      = uri
-        self.user     = user
-        self.password = password
-        self._driver: Optional[AsyncDriver] = None
+    def __init__(self, url: str, api_key: str):
+        self.url     = url
+        self.api_key = api_key
+        self.client  = QdrantClient(url=url, api_key=api_key, timeout=60)
 
     async def connect(self):
-        self._driver = AsyncGraphDatabase.driver(
-            self.uri, auth=(self.user, self.password)
-        )
-        await self._driver.verify_connectivity()
-        print(f"✅ Neo4j conectado: {self.uri}")
+        # La conexión se establece al crear el client; verificamos con get_collections
+        try:
+            self.client.get_collections()
+            print(f"✅ Qdrant Cloud conectado: {self.url}")
+        except Exception as e:
+            raise ConnectionError(f"No se pudo conectar a Qdrant Cloud: {e}")
 
     async def close(self):
-        if self._driver:
-            await self._driver.close()
-
-    async def run(self, query: str, params: Dict = None) -> List[Dict]:
-        async with self._driver.session() as session:
-            result = await session.run(query, params or {})
-            return [dict(record) for record in await result.data()]
+        try:
+            self.client.close()
+        except Exception:
+            pass
 
     async def crear_esquema(self):
-        print("🏗️ Creando esquema Neo4j (v4.2 UNI + PLIP)...")
-        constraints = [
-            "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
-            "CREATE CONSTRAINT imagen_id IF NOT EXISTS FOR (i:Imagen) REQUIRE i.id IS UNIQUE",
-            "CREATE CONSTRAINT pdf_nombre IF NOT EXISTS FOR (p:PDF) REQUIRE p.nombre IS UNIQUE",
-            "CREATE CONSTRAINT tejido_nombre IF NOT EXISTS FOR (t:Tejido) REQUIRE t.nombre IS UNIQUE",
-            "CREATE CONSTRAINT estructura_nombre IF NOT EXISTS FOR (e:Estructura) REQUIRE e.nombre IS UNIQUE",
-            "CREATE CONSTRAINT tincion_nombre IF NOT EXISTS FOR (t:Tincion) REQUIRE t.nombre IS UNIQUE",
-        ]
-        for c in constraints:
+        print("🏗️ Creando esquema Qdrant Cloud (v5.0 UNI + PLIP)...")
+        # Colección de chunks (vector único de texto Gemini)
+        try:
+            self.client.get_collection(COLLECTION_CHUNKS)
+            print(f"   ✅ Colección '{COLLECTION_CHUNKS}' ya existe")
+        except Exception:
+            self.client.create_collection(
+                collection_name=COLLECTION_CHUNKS,
+                vectors_config=VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
+            )
+            print(f"   ✅ Colección '{COLLECTION_CHUNKS}' creada")
+
+        # Colección de imágenes (vectores nombrados UNI + PLIP)
+        try:
+            self.client.get_collection(COLLECTION_IMAGENES)
+            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' ya existe")
+        except Exception:
+            self.client.create_collection(
+                collection_name=COLLECTION_IMAGENES,
+                vectors_config={
+                    "uni":  VectorParams(size=DIM_IMG_UNI,  distance=Distance.COSINE),
+                    "plip": VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
+                },
+            )
+            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' creada")
+
+        # ── Índices de Payload (necesarios para filtrado MatchAny/MatchValue) ──
+        print("   🔍 Creando índices de payload...")
+        for field in ["tejidos", "estructuras", "tinciones", "fuente"]:
             try:
-                await self.run(c)
-            except Exception as e:
-                print(f"  ⚠️ Constraint: {e}")
+                self.client.create_payload_index(
+                    collection_name=COLLECTION_CHUNKS,
+                    field_name=field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                pass
+        
+        try:
+            self.client.create_payload_index(
+                collection_name=COLLECTION_IMAGENES,
+                field_name="fuente",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass
 
-        # 3 Índices Vectoriales
-        vector_queries = [
-            # 1. TEXTO (Gemini)
-            f"""
-            CREATE VECTOR INDEX {INDEX_TEXTO} IF NOT EXISTS
-            FOR (c:Chunk) ON c.embedding
-            OPTIONS {{indexConfig: {{
-                `vector.dimensions`: {DIM_TEXTO_GEMINI},
-                `vector.similarity_function`: 'cosine'
-            }}}}
-            """,
-            # 2. IMAGEN UNI
-            f"""
-            CREATE VECTOR INDEX {INDEX_UNI} IF NOT EXISTS
-            FOR (i:Imagen) ON i.embedding_uni
-            OPTIONS {{indexConfig: {{
-                `vector.dimensions`: {DIM_IMG_UNI},
-                `vector.similarity_function`: 'cosine'
-            }}}}
-            """,
-            # 3. IMAGEN PLIP
-            f"""
-            CREATE VECTOR INDEX {INDEX_PLIP} IF NOT EXISTS
-            FOR (i:Imagen) ON i.embedding_plip
-            OPTIONS {{indexConfig: {{
-                `vector.dimensions`: {DIM_IMG_PLIP},
-                `vector.similarity_function`: 'cosine'
-            }}}}
-            """,
-        ]
-        for vq in vector_queries:
-            try:
-                await self.run(vq)
-            except Exception as e:
-                print(f"  ⚠️ Vector index error: {e}")
+        print("✅ Esquema Qdrant listo (2 colecciones + índices de payload)")
 
-        print("✅ Esquema Neo4j listo (3 índices)")
-
-    async def upsert_pdf(self, nombre: str):
-        await self.run("MERGE (p:PDF {nombre: $nombre})", {"nombre": nombre})
+    # ------------------------------------------------------------------
+    # Escritura (indexación)
+    # ------------------------------------------------------------------
 
     async def upsert_chunk(self, chunk_id: str, texto: str, fuente: str,
                             chunk_idx: int, embedding: List[float],
                             entidades: Dict[str, List[str]]):
-        await self.run("""
-            MERGE (c:Chunk {id: $id})
-            SET c.texto = $texto, c.fuente = $fuente,
-                c.chunk_id = $chunk_idx, c.embedding = $embedding
-            WITH c
-            MERGE (pdf:PDF {nombre: $fuente})
-            MERGE (c)-[:PERTENECE_A]->(pdf)
-        """, {
-            "id": chunk_id, "texto": texto, "fuente": fuente,
-            "chunk_idx": chunk_idx, "embedding": embedding
-        })
-        for tejido in entidades.get("tejidos", []):
-            await self.run("""
-                MERGE (t:Tejido {nombre: $nombre})
-                WITH t MATCH (c:Chunk {id: $chunk_id})
-                MERGE (c)-[:MENCIONA]->(t)
-            """, {"nombre": tejido, "chunk_id": chunk_id})
-        for estructura in entidades.get("estructuras", []):
-            await self.run("""
-                MERGE (e:Estructura {nombre: $nombre})
-                WITH e MATCH (c:Chunk {id: $chunk_id})
-                MERGE (c)-[:MENCIONA]->(e)
-            """, {"nombre": estructura, "chunk_id": chunk_id})
-        for tincion in entidades.get("tinciones", []):
-            await self.run("""
-                MERGE (t:Tincion {nombre: $nombre})
-                WITH t MATCH (c:Chunk {id: $chunk_id})
-                MERGE (c)-[:MENCIONA]->(t)
-            """, {"nombre": tincion, "chunk_id": chunk_id})
-        for tejido in entidades.get("tejidos", []):
-            for estructura in entidades.get("estructuras", []):
-                await self.run("""
-                    MERGE (t:Tejido {nombre: $tejido})
-                    MERGE (e:Estructura {nombre: $estructura})
-                    MERGE (t)-[:CONTIENE]->(e)
-                """, {"tejido": tejido, "estructura": estructura})
-            for tincion in entidades.get("tinciones", []):
-                await self.run("""
-                    MERGE (t:Tejido {nombre: $tejido})
-                    MERGE (ti:Tincion {nombre: $tincion})
-                    MERGE (t)-[:TENIDA_CON]->(ti)
-                """, {"tejido": tejido, "tincion": tincion})
-        for estructura in entidades.get("estructuras", []):
-            for tincion in entidades.get("tinciones", []):
-                await self.run("""
-                    MERGE (e:Estructura {nombre: $estructura})
-                    MERGE (ti:Tincion {nombre: $tincion})
-                    MERGE (e)-[:TENIDA_CON]->(ti)
-                """, {"estructura": estructura, "tincion": tincion})
+        point = PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)),
+            vector=embedding,
+            payload={
+                "chunk_id":     chunk_id,
+                "texto":        texto,
+                "fuente":       fuente,
+                "chunk_idx":    chunk_idx,
+                "tipo":         "texto",
+                "tejidos":      entidades.get("tejidos", []),
+                "estructuras":  entidades.get("estructuras", []),
+                "tinciones":    entidades.get("tinciones", []),
+            },
+        )
+        self.client.upsert(collection_name=COLLECTION_CHUNKS, points=[point])
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
-                             pagina: int, ocr_text: str, 
+                             pagina: int, ocr_text: str,
                              emb_uni: List[float], emb_plip: List[float]):
-        await self.run("""
-            MERGE (i:Imagen {id: $id})
-            SET i.path = $path, i.fuente = $fuente,
-                i.pagina = $pagina, i.ocr_text = $ocr_text,
-                i.embedding_uni = $emb_uni,
-                i.embedding_plip = $emb_plip
-            WITH i
-            MERGE (pdf:PDF {nombre: $fuente})
-            MERGE (i)-[:PERTENECE_A]->(pdf)
-            MERGE (pag:Pagina {numero: $pagina, pdf_nombre: $fuente})
-            MERGE (i)-[:EN_PAGINA]->(pag)
-        """, {
-            "id": imagen_id, "path": path, "fuente": fuente,
-            "pagina": pagina, "ocr_text": ocr_text, 
-            "emb_uni": emb_uni, "emb_plip": emb_plip
-        })
-
-    async def crear_relaciones_similitud(self, umbral: float = SIMILAR_IMG_THRESHOLD):
-        # Usamos UNI para similitud visual (multimodal)
-        print(f"🔗 Creando relaciones :SIMILAR_A (usando UNI, umbral={umbral})...")
-        imagenes = await self.run(
-            "MATCH (i:Imagen) WHERE i.embedding_uni IS NOT NULL RETURN i.id AS id, i.embedding_uni AS emb"
+        point = PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, imagen_id)),
+            vector={"uni": emb_uni, "plip": emb_plip},
+            payload={
+                "imagen_id": imagen_id,
+                "path":      path,
+                "fuente":    fuente,
+                "pagina":    pagina,
+                "ocr_text":  ocr_text,
+                "tipo":      "imagen",
+            },
         )
-        if len(imagenes) < 2:
-            return
-        creadas = 0
-        for img in imagenes:
-            resultado = await self.run("""
-                CALL db.index.vector.queryNodes($index, 6, $emb)
-                YIELD node AS vecino, score
-                WHERE vecino.id <> $id AND score >= $umbral
-                WITH vecino, score
-                MATCH (origen:Imagen {id: $id})
-                MERGE (origen)-[r:SIMILAR_A]->(vecino)
-                SET r.score = score
-                RETURN count(*) AS n
-            """, {
-                "index": INDEX_UNI,
-                "emb": img["emb"], "id": img["id"], "umbral": umbral
-            })
-            creadas += resultado[0]["n"] if resultado else 0
-        print(f"✅ {creadas} relaciones :SIMILAR_A creadas")
+        self.client.upsert(collection_name=COLLECTION_IMAGENES, points=[point])
 
-    async def busqueda_vectorial(self, embedding: List[float],
-                                  index_name: str, top_k: int = 10) -> List[Dict]:
-        is_text_index = index_name == INDEX_TEXTO
-        if is_text_index:
-             query = """
-                CALL db.index.vector.queryNodes($index, $k, $emb)
-                YIELD node AS c, score
-                RETURN c.id AS id, c.texto AS texto, c.fuente AS fuente,
-                       'texto' AS tipo, null AS imagen_path, score AS similitud
-                ORDER BY similitud DESC
-            """
-        else:
-             query = """
-                CALL db.index.vector.queryNodes($index, $k, $emb)
-                YIELD node AS i, score
-                RETURN i.id AS id, i.ocr_text AS texto, i.fuente AS fuente,
-                       'imagen' AS tipo, i.path AS imagen_path, score AS similitud
-                ORDER BY similitud DESC
-            """
+    # ------------------------------------------------------------------
+    # Lectura (búsqueda)
+    # ------------------------------------------------------------------
+
+    async def busqueda_vectorial_texto(self, embedding: List[float],
+                                        top_k: int = 10) -> List[Dict]:
         try:
-            return await self.run(query, {"index": index_name, "emb": embedding, "k": top_k})
+            results = self.client.query_points(
+                collection_name=COLLECTION_CHUNKS,
+                query=embedding,
+                limit=top_k,
+            ).points
+            return [
+                {
+                    "id":          str(r.id),
+                    "texto":       r.payload.get("texto", ""),
+                    "fuente":      r.payload.get("fuente", ""),
+                    "tipo":        "texto",
+                    "imagen_path": None,
+                    "similitud":   r.score,
+                }
+                for r in results
+            ]
         except Exception as e:
-            print(f"⚠️ Error búsqueda vectorial {index_name}: {e}")
+            print(f"⚠️ Error búsqueda vectorial texto: {e}")
+            return []
+
+    async def busqueda_vectorial_imagen(self, embedding: List[float],
+                                         using: str, top_k: int = 10) -> List[Dict]:
+        try:
+            results = self.client.query_points(
+                collection_name=COLLECTION_IMAGENES,
+                query=embedding,
+                using=using,
+                limit=top_k,
+            ).points
+            return [
+                {
+                    "id":          str(r.id),
+                    "texto":       r.payload.get("ocr_text", ""),
+                    "fuente":      r.payload.get("fuente", ""),
+                    "tipo":        "imagen",
+                    "imagen_path": r.payload.get("path"),
+                    "similitud":   r.score,
+                }
+                for r in results
+            ]
+        except Exception as e:
+            print(f"⚠️ Error búsqueda vectorial imagen ({using}): {e}")
             return []
 
     async def busqueda_por_entidades(self, entidades: Dict[str, List[str]],
@@ -529,108 +484,89 @@ class Neo4jClient:
         if not any([tejidos, estructuras, tinciones]):
             return []
 
-        where_clauses = []
-        params: Dict[str, Any] = {}
+        conditions = []
         if tejidos:
-            where_clauses.append("ANY(t IN tejidos WHERE t.nombre IN $tejidos)")
-            params["tejidos"] = tejidos
+            conditions.append(FieldCondition(key="tejidos", match=MatchAny(any=tejidos)))
         if estructuras:
-            where_clauses.append("ANY(e IN estructuras WHERE e.nombre IN $estructuras)")
-            params["estructuras"] = estructuras
+            conditions.append(FieldCondition(key="estructuras", match=MatchAny(any=estructuras)))
         if tinciones:
-            where_clauses.append("ANY(ti IN tinciones WHERE ti.nombre IN $tinciones)")
-            params["tinciones"] = tinciones
+            conditions.append(FieldCondition(key="tinciones", match=MatchAny(any=tinciones)))
 
-        where_str = " OR ".join(where_clauses)
-        query = f"""
-            MATCH (c:Chunk)
-            OPTIONAL MATCH (c)-[:MENCIONA]->(t:Tejido)
-            OPTIONAL MATCH (c)-[:MENCIONA]->(e:Estructura)
-            OPTIONAL MATCH (c)-[:MENCIONA]->(ti:Tincion)
-            WITH c,
-                 collect(DISTINCT t) AS tejidos,
-                 collect(DISTINCT e) AS estructuras,
-                 collect(DISTINCT ti) AS tinciones
-            WHERE {where_str}
-            RETURN c.id AS id, c.texto AS texto, c.fuente AS fuente,
-                   'texto' AS tipo, null AS imagen_path, 0.5 AS similitud
-            LIMIT $top_k
-        """
-        params["top_k"] = top_k
         try:
-            return await self.run(query, params)
+            results, _ = self.client.scroll(
+                collection_name=COLLECTION_CHUNKS,
+                scroll_filter=Filter(should=conditions),
+                limit=top_k,
+            )
+            return [
+                {
+                    "id":          str(r.id),
+                    "texto":       r.payload.get("texto", ""),
+                    "fuente":      r.payload.get("fuente", ""),
+                    "tipo":        "texto",
+                    "imagen_path": None,
+                    "similitud":   0.5,
+                }
+                for r in results
+            ]
         except Exception as e:
             print(f"⚠️ Error búsqueda entidades: {e}")
             return []
 
-    async def expandir_vecindad(self, node_ids: List[str],
-                                 depth: int = NEO4J_GRAPH_DEPTH) -> List[Dict]:
-        if not node_ids:
-            return []
-        query = """
-            UNWIND $ids AS nid
-            MATCH (n {id: nid})
-
-            // Expansión 1: otros nodos en el mismo PDF (excluir el nodo origen)
-            OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf:PDF)<-[:PERTENECE_A]-(vecino_pdf)
-            WHERE vecino_pdf.id <> nid
-            WITH n, nid, collect(DISTINCT vecino_pdf)[..5] AS list_pdf
-
-            // Expansión 2: chunks que comparten entidades (excluir el nodo origen)
-            OPTIONAL MATCH (n)-[:MENCIONA]->(entidad)<-[:MENCIONA]-(vecino_entidad:Chunk)
-            WHERE vecino_entidad.id <> nid
-            WITH n, nid, list_pdf, collect(DISTINCT vecino_entidad)[..5] AS list_ent
-
-            // Expansión 3: imágenes similares por embedding
-            OPTIONAL MATCH (n)-[:SIMILAR_A]-(vecino_similar:Imagen)
-            WITH n, nid, list_pdf, list_ent, collect(DISTINCT vecino_similar)[..5] AS list_sim
-
-            // Expansión 4: imágenes de la misma página que el chunk
-            OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf2:PDF)<-[:PERTENECE_A]-(img_pag:Imagen)
-            WITH nid, list_pdf, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
-
-            WITH $ids AS ids_originales,
-                 list_pdf + list_ent + list_sim + list_pag AS vecinos_raw
-
-            UNWIND vecinos_raw AS v
-
-            WITH v, ids_originales
-            WHERE v IS NOT NULL AND NOT v.id IN ids_originales
-
-            RETURN DISTINCT
-                v.id AS id,
-                CASE WHEN v:Imagen THEN coalesce(v.ocr_text, '') ELSE coalesce(v.texto, '') END AS texto,
-                v.fuente AS fuente,
-                CASE WHEN v:Imagen THEN 'imagen' ELSE 'texto' END AS tipo,
-                CASE WHEN v:Imagen THEN v.path ELSE null END AS imagen_path,
-                0.3 AS similitud
-            LIMIT 10
-        """
-        try:
-            return await self.run(query, {"ids": node_ids})
-        except Exception as e:
-            print(f"⚠️ Error expansión vecindad: {e}")
+    async def expandir_vecindad(self, resultados_top: List[Dict],
+                                 top_k: int = 10) -> List[Dict]:
+        """Busca más chunks e imágenes de las mismas fuentes que los top results."""
+        if not resultados_top:
             return []
 
-    async def busqueda_camino_semantico(self,
-                                         tejido_origen: Optional[str],
-                                         tejido_destino: Optional[str]) -> List[Dict]:
-        if not tejido_origen or not tejido_destino:
-            return []
-        query = """
-            MATCH (origen {nombre: $origen}), (destino {nombre: $destino})
-            MATCH path = shortestPath((origen)-[*1..4]-(destino))
-            UNWIND nodes(path) AS nodo
-            OPTIONAL MATCH (c:Chunk)-[:MENCIONA]->(nodo)
-            RETURN DISTINCT c.id AS id, c.texto AS texto, c.fuente AS fuente,
-                   'texto' AS tipo, null AS imagen_path, 0.4 AS similitud
-            LIMIT 5
-        """
-        try:
-            return await self.run(query, {"origen": tejido_origen, "destino": tejido_destino})
-        except Exception as e:
-            print(f"⚠️ Error búsqueda camino: {e}")
-            return []
+        fuentes = list(set(r.get("fuente") for r in resultados_top if r.get("fuente")))
+        ids_originales = set(r.get("id") for r in resultados_top)
+        vecinos: List[Dict] = []
+
+        for fuente in fuentes[:3]:
+            try:
+                results, _ = self.client.scroll(
+                    collection_name=COLLECTION_CHUNKS,
+                    scroll_filter=Filter(must=[
+                        FieldCondition(key="fuente", match=MatchValue(value=fuente))
+                    ]),
+                    limit=5,
+                )
+                for r in results:
+                    rid = str(r.id)
+                    if rid not in ids_originales:
+                        vecinos.append({
+                            "id": rid, "texto": r.payload.get("texto", ""),
+                            "fuente": r.payload.get("fuente", ""), "tipo": "texto",
+                            "imagen_path": None, "similitud": 0.3,
+                        })
+            except Exception:
+                pass
+
+            try:
+                results, _ = self.client.scroll(
+                    collection_name=COLLECTION_IMAGENES,
+                    scroll_filter=Filter(must=[
+                        FieldCondition(key="fuente", match=MatchValue(value=fuente))
+                    ]),
+                    limit=3,
+                )
+                for r in results:
+                    rid = str(r.id)
+                    if rid not in ids_originales:
+                        vecinos.append({
+                            "id": rid, "texto": r.payload.get("ocr_text", ""),
+                            "fuente": r.payload.get("fuente", ""), "tipo": "imagen",
+                            "imagen_path": r.payload.get("path"), "similitud": 0.3,
+                        })
+            except Exception:
+                pass
+
+        return vecinos[:top_k]
+
+    # ------------------------------------------------------------------
+    # Búsqueda híbrida (punto de entrada principal)
+    # ------------------------------------------------------------------
 
     async def busqueda_hibrida(self,
                                 texto_embedding: Optional[List[float]],
@@ -646,24 +582,24 @@ class Neo4jClient:
 
         # 1. Búsqueda Texto (Gemini)
         if texto_embedding:
-            res_texto = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k)
+            res_texto = await self.busqueda_vectorial_texto(texto_embedding, top_k)
 
         # 2. Búsqueda Imagen UNI
         if imagen_embedding_uni:
-            res_uni = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
+            res_uni = await self.busqueda_vectorial_imagen(imagen_embedding_uni, "uni", top_k)
 
         # 3. Búsqueda Imagen PLIP
         if imagen_embedding_plip:
-            res_plip = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
+            res_plip = await self.busqueda_vectorial_imagen(imagen_embedding_plip, "plip", top_k)
 
-        # 4. Entidades
+        # 4. Entidades (filtro por payload)
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
 
         # Vecindad sobre los mejores
         todos = res_texto + res_uni + res_plip
-        top_ids = [r["id"] for r in todos[:6] if r.get("id")]
-        if top_ids:
-            res_vec = await self.expandir_vecindad(top_ids)
+        top_results = todos[:6]
+        if top_results:
+            res_vec = await self.expandir_vecindad(top_results)
 
         combined: Dict[str, Dict] = {}
 
@@ -679,10 +615,10 @@ class Neo4jClient:
                     combined[key]["similitud"] += sim_ponderada
 
         # Pesos ajustados
-        agregar(res_texto, 0.40) # Texto sigue siendo fundamental
-        agregar(res_uni,   0.20) # UNI complemento visual
-        agregar(res_plip,  0.20) # PLIP complemento visual
-        agregar(res_ent,   0.35) # Entidades (¡Crucial para discriminar órganos!)
+        agregar(res_texto, 0.40)  # Texto sigue siendo fundamental
+        agregar(res_uni,   0.20)  # UNI complemento visual
+        agregar(res_plip,  0.20)  # PLIP complemento visual
+        agregar(res_ent,   0.35)  # Entidades (filtro payload)
         agregar(res_vec,   0.10)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
@@ -691,6 +627,22 @@ class Neo4jClient:
               f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
 
         return final[:15]
+
+    # ------------------------------------------------------------------
+    # Utilidades
+    # ------------------------------------------------------------------
+
+    async def contar_chunks(self) -> int:
+        try:
+            return self.client.get_collection(COLLECTION_CHUNKS).points_count
+        except Exception:
+            return 0
+
+    async def contar_imagenes(self) -> int:
+        try:
+            return self.client.get_collection(COLLECTION_IMAGENES).points_count
+        except Exception:
+            return 0
 
 
 # =============================================================================
@@ -995,26 +947,192 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
 # =============================================================================
 
 class ExtractorImagenesPDF:
-    RENDER_DPI = 150
+    """
+    Extrae imágenes individuales de PDFs usando PyMuPDF (fitz).
+    Método primario: get_image_info(xrefs=True) + extract_image(xref)
+    para extraer figuras reales en lugar de renderizar páginas completas.
+    Fallback: renderizado de página completa con pdf2image.
+    """
+    RENDER_DPI = 200
+    MIN_IMAGE_SIZE = 150    # px mínimo ancho/alto para filtrar íconos
+    MAX_IMAGE_SIZE = (1280, 1280)
 
     def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES):
         self.directorio_salida = directorio_salida
         os.makedirs(directorio_salida, exist_ok=True)
 
     def extraer_de_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
-        imagenes   = []
+        imagenes = []
         nombre_pdf = os.path.splitext(os.path.basename(pdf_path))[0]
+
+        # ── Método primario: PyMuPDF (extrae imágenes individuales) ───
+        try:
+            doc = fitz.open(pdf_path)
+            image_count = 0
+            seen_xrefs = set()       # Evitar duplicados por xref
+            seen_hashes = set()      # Evitar duplicados por contenido
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                valid_images_this_page = []
+
+                # get_image_info(xrefs=True) → solo imágenes dibujadas en esta página
+                img_info_list = page.get_image_info(xrefs=True)
+                page_xrefs = [info["xref"] for info in img_info_list if info.get("xref")]
+                # Deduplicar xrefs dentro de la misma página
+                page_xrefs = list(dict.fromkeys(page_xrefs))
+
+                if page_xrefs:
+                    for xref in page_xrefs:
+                        # Saltar xrefs ya procesados en páginas anteriores
+                        if xref in seen_xrefs:
+                            continue
+                        seen_xrefs.add(xref)
+                        try:
+                            base_image = doc.extract_image(xref)
+                            if not base_image:
+                                continue
+
+                            image_bytes = base_image["image"]
+                            ext = base_image["ext"]
+
+                            # Deduplicar por contenido (misma imagen en distintos xrefs)
+                            import hashlib
+                            img_hash = hashlib.md5(image_bytes).hexdigest()
+                            if img_hash in seen_hashes:
+                                continue
+                            seen_hashes.add(img_hash)
+
+                            image_count += 1
+
+                            img_path = os.path.join(
+                                self.directorio_salida,
+                                f"{nombre_pdf}_p{page_num+1}_img{image_count}.{ext}"
+                            )
+                            with open(img_path, "wb") as f:
+                                f.write(image_bytes)
+
+                            img_pil = Image.open(img_path)
+                            width, height = img_pil.size
+                            area = width * height
+
+                            # Filtro: descartar íconos diminutos
+                            if width >= self.MIN_IMAGE_SIZE and height >= self.MIN_IMAGE_SIZE:
+                                # Convertir a RGB/JPG para consistencia
+                                if img_pil.mode != "RGB":
+                                    img_pil = img_pil.convert("RGB")
+                                img_path_rgb = os.path.join(
+                                    self.directorio_salida,
+                                    f"{nombre_pdf}_p{page_num+1}_img{image_count}.jpg"
+                                )
+                                img_pil.save(img_path_rgb, "JPEG")
+                                if img_path != img_path_rgb:
+                                    try:
+                                        os.remove(img_path)
+                                    except OSError:
+                                        pass
+                                img_path = img_path_rgb
+
+                                # Extraer texto de la página y OCR
+                                try:
+                                    texto_pagina = page.get_text("text").strip()
+                                    import re
+                                    texto_pagina = re.sub(r'\s+', ' ', texto_pagina)
+                                    ocr_img = pytesseract.image_to_string(img_pil).strip()[:200]
+                                    ocr_text = f"[{ocr_img}] {texto_pagina}"[:1500]
+                                except Exception:
+                                    ocr_text = ""
+
+                                valid_images_this_page.append({
+                                    "path": img_path,
+                                    "fuente_pdf": os.path.basename(pdf_path),
+                                    "pagina": page_num + 1,
+                                    "indice": image_count,
+                                    "ocr_text": ocr_text,
+                                    "area": area,
+                                })
+                            else:
+                                # Imagen demasiado pequeña, eliminar
+                                try:
+                                    os.remove(img_path)
+                                except OSError:
+                                    pass
+                        except Exception as e:
+                            print(f"  ⚠️ Error xref {xref} pág {page_num+1}: {e}")
+
+                else:
+                    # Fallback por página: no hay xrefs → renderizar página completa
+                    try:
+                        page_imgs = convert_from_path(
+                            pdf_path, first_page=page_num+1, last_page=page_num+1,
+                            dpi=self.RENDER_DPI, fmt='jpeg', size=self.MAX_IMAGE_SIZE
+                        )
+                        if page_imgs:
+                            image_count += 1
+                            img_path = os.path.join(
+                                self.directorio_salida,
+                                f"{nombre_pdf}_p{page_num+1}_img{image_count}.jpg"
+                            )
+                            page_imgs[0].save(img_path, "JPEG")
+                            width, height = page_imgs[0].size
+
+                            try:
+                                texto_pagina = page.get_text("text").strip()
+                                import re
+                                texto_pagina = re.sub(r'\s+', ' ', texto_pagina)
+                                ocr_img = pytesseract.image_to_string(page_imgs[0]).strip()[:200]
+                                ocr_text = f"[{ocr_img}] {texto_pagina}"[:1500]
+                            except Exception:
+                                ocr_text = ""
+
+                            valid_images_this_page.append({
+                                "path": img_path,
+                                "fuente_pdf": os.path.basename(pdf_path),
+                                "pagina": page_num + 1,
+                                "indice": image_count,
+                                "ocr_text": ocr_text,
+                                "area": width * height,
+                            })
+                            print(f"      📸 Pág {page_num+1}: renderizada completa ({width}x{height})")
+                    except Exception as e:
+                        print(f"  ⚠️ Error renderizando pág {page_num+1}: {e}")
+
+                # Conservar SOLO la imagen más grande de la página
+                if valid_images_this_page:
+                    largest = max(valid_images_this_page, key=lambda x: x["area"])
+                    for img_data in valid_images_this_page:
+                        if img_data["path"] != largest["path"]:
+                            try:
+                                os.remove(img_data["path"])
+                            except OSError:
+                                pass
+                    # Quitar campo auxiliar 'area' antes de guardar
+                    largest.pop("area", None)
+                    imagenes.append(largest)
+
+            doc.close()
+
+            if imagenes:
+                print(f"  📸 {len(imagenes)} figuras extraídas de {os.path.basename(pdf_path)} (PyMuPDF)")
+                return imagenes
+
+            print(f"  ⚠️ Sin figuras vía PyMuPDF, usando fallback de página completa...")
+
+        except Exception as e:
+            print(f"  ⚠️ Error PyMuPDF ({e}), usando fallback de página completa...")
+
+        # ── Fallback global: renderizar todas las páginas ─────────────
         try:
             paginas = convert_from_path(pdf_path, dpi=self.RENDER_DPI)
         except Exception as e:
-            print(f"❌ Error renderizando {pdf_path}: {e}")
+            print(f"  ❌ Error renderizando {pdf_path}: {e}")
             return []
 
         for num_pagina, pil_img in enumerate(paginas, start=1):
-            nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.png"
-            ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+            nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.jpg"
+            ruta_completa = os.path.join(self.directorio_salida, nombre_archivo)
             try:
-                pil_img.save(ruta_completa, format="PNG")
+                pil_img.save(ruta_completa, format="JPEG")
                 try:
                     ocr_text = pytesseract.image_to_string(pil_img).strip()[:300]
                 except Exception:
@@ -1026,16 +1144,16 @@ class ExtractorImagenesPDF:
             except Exception as e:
                 print(f"  ⚠️ Error pág {num_pagina}: {e}")
 
-        print(f"  📸 {len(imagenes)} páginas de {os.path.basename(pdf_path)}")
+        print(f"  📸 {len(imagenes)} páginas de {os.path.basename(pdf_path)} (fallback)")
         return imagenes
 
     def extraer_de_directorio(self, directorio: str) -> List[Dict[str, str]]:
         todas = []
         pdfs  = glob.glob(os.path.join(directorio, "*.pdf"))
-        print(f"📂 Extrayendo {len(pdfs)} PDFs...")
+        print(f"📂 Extrayendo imágenes de {len(pdfs)} PDFs...")
         for pdf_path in pdfs:
             todas.extend(self.extraer_de_pdf(pdf_path))
-        print(f"✅ Total imágenes: {len(todas)}")
+        print(f"✅ Total imágenes extraídas: {len(todas)}")
         return todas
 
 
@@ -1170,7 +1288,7 @@ class AgentState(TypedDict):
 # ASISTENTE PRINCIPAL v4.1
 # =============================================================================
 
-class AsistenteHistologiaNeo4j:
+class AsistenteHistologiaQdrant:
 
     SIMILARITY_THRESHOLD = SIMILARITY_THRESHOLD
 
@@ -1188,7 +1306,7 @@ class AsistenteHistologiaNeo4j:
         self.embeddings = None  # Google Embeddings
         self.embed_dim = DIM_TEXTO_GEMINI
 
-        self.neo4j: Optional[Neo4jClient] = None
+        self.qdrant_store: Optional[QdrantVectorStore] = None
 
         self.extractor_imagenes       = ExtractorImagenesPDF(DIRECTORIO_IMAGENES)
         self.extractor_temario        = None
@@ -1204,7 +1322,7 @@ class AsistenteHistologiaNeo4j:
                     self.device = "cpu"
             except:
                 pass
-        print(f"✅ AsistenteHistologiaNeo4j v4.1 inicializado en {self.device}")
+        print(f"✅ AsistenteHistologiaQdrant v5.0 inicializado en {self.device}")
 
     def _setup_apis(self):
         os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY") or ""
@@ -1231,13 +1349,12 @@ class AsistenteHistologiaNeo4j:
             temario=[]   # se actualizará tras extraer el temario
         )
 
-        self.neo4j = Neo4jClient(
-            uri      = userdata.get("NEO4J_URI")      or os.getenv("NEO4J_URI"),
-            user     = userdata.get("NEO4J_USERNAME")  or os.getenv("NEO4J_USERNAME", "neo4j"),
-            password = userdata.get("NEO4J_PASSWORD")  or os.getenv("NEO4J_PASSWORD"),
+        self.qdrant_store = QdrantVectorStore(
+            url     = userdata.get("QDRANT_URL") or os.getenv("QDRANT_URL"),
+            api_key = userdata.get("QDRANT_KEY") or os.getenv("QDRANT_KEY"),
         )
-        await self.neo4j.connect()
-        await self.neo4j.crear_esquema()
+        await self.qdrant_store.connect()
+        await self.qdrant_store.crear_esquema()
 
         self.memory_saver   = MemorySaver()
         self._crear_grafo()
@@ -1281,7 +1398,7 @@ class AsistenteHistologiaNeo4j:
         g.add_node("procesar_imagen",      self._nodo_procesar_imagen)
         g.add_node("clasificar",           self._nodo_clasificar)
         g.add_node("generar_consulta",     self._nodo_generar_consulta)
-        g.add_node("buscar_neo4j",         self._nodo_buscar_neo4j)
+        g.add_node("buscar_qdrant",        self._nodo_buscar_qdrant)
         g.add_node("filtrar_contexto",     self._nodo_filtrar_contexto)
         g.add_node("analisis_comparativo", self._nodo_analisis_comparativo)
         g.add_node("generar_respuesta",    self._nodo_generar_respuesta)
@@ -1298,8 +1415,8 @@ class AsistenteHistologiaNeo4j:
             {"en_temario": "generar_consulta", "fuera_temario": "fuera_temario"}
         )
         g.add_edge("fuera_temario",        "finalizar")
-        g.add_edge("generar_consulta",     "buscar_neo4j")
-        g.add_edge("buscar_neo4j",         "filtrar_contexto")
+        g.add_edge("generar_consulta",     "buscar_qdrant")
+        g.add_edge("buscar_qdrant",        "filtrar_contexto")
         g.add_edge("filtrar_contexto",     "analisis_comparativo")
         g.add_edge("analisis_comparativo", "generar_respuesta")
         g.add_edge("generar_respuesta",    "finalizar")
@@ -1315,7 +1432,7 @@ class AsistenteHistologiaNeo4j:
     # ------------------------------------------------------------------
 
     async def _nodo_inicializar(self, state: AgentState) -> AgentState:
-        print("📝 Inicializando flujo v4.1 (Neo4j)")
+        print("📝 Inicializando flujo v5.0 (Qdrant)")
         state["contexto_memoria"]            = self.memoria.get_context(state.get("consulta_texto", ""))
         state["contenido_base"]              = self.contenido_base
         state["tiempo_inicio"]               = time.time()
@@ -1569,11 +1686,11 @@ class AsistenteHistologiaNeo4j:
         })
         return state
 
-    async def _nodo_buscar_neo4j(self, state: AgentState) -> AgentState:
+    async def _nodo_buscar_qdrant(self, state: AgentState) -> AgentState:
         t0 = time.time()
-        print("📚 Búsqueda híbrida Neo4j...")
+        print("📚 Búsqueda híbrida Qdrant...")
 
-        resultados = await self.neo4j.busqueda_hibrida(
+        resultados = await self.qdrant_store.busqueda_hibrida(
             texto_embedding        = state.get("texto_embedding"),
             imagen_embedding_uni   = state.get("imagen_embedding_uni"),
             imagen_embedding_plip  = state.get("imagen_embedding_plip"),
@@ -1581,18 +1698,11 @@ class AsistenteHistologiaNeo4j:
             top_k                  = 10
         )
 
-        tejidos = state.get("entidades_consulta", {}).get("tejidos", [])
-        if len(tejidos) >= 2:
-            camino = await self.neo4j.busqueda_camino_semantico(tejidos[0], tejidos[1])
-            if camino:
-                print(f"   🗺️ Camino semántico: {len(camino)} nodos")
-                resultados.extend(camino)
-
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
 
         state["trayectoria"].append({
-            "nodo": "BuscarNeo4j", "hits": len(resultados),
+            "nodo": "BuscarQdrant", "hits": len(resultados),
             "tiempo": round(time.time()-t0, 2)
         })
         return state
@@ -1878,7 +1988,7 @@ class AsistenteHistologiaNeo4j:
         total = round(time.time() - state["tiempo_inicio"], 2)
         state["trayectoria"].append({"nodo": "Finalizar", "tiempo_total": total})
 
-        with open("trayectoria_neo4j.json", "w", encoding="utf-8") as f:
+        with open("trayectoria_qdrant.json", "w", encoding="utf-8") as f:
             json.dump({
                 "trayectoria":             state["trayectoria"],
                 "estructura_identificada": state.get("estructura_identificada"),
@@ -1886,7 +1996,7 @@ class AsistenteHistologiaNeo4j:
                 "entidades_consulta":      state.get("entidades_consulta", {}),
             }, f, indent=4, ensure_ascii=False)
 
-        print(f"✅ Flujo v4.1 completado en {total}s")
+        print(f"✅ Flujo v5.0 completado en {total}s")
         if state.get("estructura_identificada"):
             print(f"   → Estructura: {state['estructura_identificada']}")
         return state
@@ -1901,7 +2011,7 @@ class AsistenteHistologiaNeo4j:
 
 
     # ------------------------------------------------------------------
-    # Indexación en Neo4j
+    # Indexación en Qdrant
     # ------------------------------------------------------------------
 
     def _leer_pdf(self, path: str) -> str:
@@ -1937,27 +2047,24 @@ class AsistenteHistologiaNeo4j:
             print(f"   🔄 Clasificador semántico actualizado con "
                   f"{len(self.extractor_temario.temas)} temas")
 
-    async def indexar_en_neo4j(self, directorio_pdfs: str = DIRECTORIO_PDFS,
+    async def indexar_en_qdrant(self, directorio_pdfs: str = DIRECTORIO_PDFS,
                                  imagen_files_extra: Optional[List[str]] = None,
                                  forzar: bool = False):
         # ── Verificar si ya hay datos ────────────────────────────────
         if not forzar:
             try:
-                res_chunks = await self.neo4j.run("MATCH (c:Chunk) RETURN count(c) AS n")
-                res_imgs   = await self.neo4j.run("MATCH (i:Imagen) RETURN count(i) AS n")
-                n_chunks = res_chunks[0]["n"] if res_chunks else 0
-                n_imgs   = res_imgs[0]["n"]   if res_imgs   else 0
+                n_chunks = await self.qdrant_store.contar_chunks()
+                n_imgs   = await self.qdrant_store.contar_imagenes()
                 if n_chunks > 0 and n_imgs > 0:
-                    print(f"✅ Base de datos Neo4j ya poblada ({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
+                    print(f"✅ Base de datos Qdrant ya poblada ({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
                     print("   (Usá --reindex --force para forzar re-indexación)")
                     return
             except Exception as e:
                 print(f"⚠️ No se pudo verificar estado de la BD: {e}")
 
-        print("📄 Indexando chunks de texto en Neo4j...")
+        print("📄 Indexando chunks de texto en Qdrant...")
         for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
             fuente = os.path.basename(pdf_path)
-            await self.neo4j.upsert_pdf(fuente)
             texto  = self._leer_pdf(pdf_path)
             chunks = self._chunks(texto)
             print(f"  {fuente}: {len(chunks)} chunks")
@@ -1966,14 +2073,14 @@ class AsistenteHistologiaNeo4j:
                     emb       = self._embed_texto_gemini(chunk)
                     chunk_id  = f"chunk_{fuente}_{i}"
                     entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
-                    await self.neo4j.upsert_chunk(
+                    await self.qdrant_store.upsert_chunk(
                         chunk_id=chunk_id, texto=chunk, fuente=fuente,
                         chunk_idx=i, embedding=emb, entidades=entidades
                     )
                 except Exception as e:
                     print(f"  ⚠️ Chunk {i}: {e}")
 
-        print("📸 Indexando imágenes de PDFs en Neo4j...")
+        print("📸 Indexando imágenes de PDFs en Qdrant...")
         imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
         for img_info in imagenes_pdf:
             img_path = img_info["path"]
@@ -1985,7 +2092,7 @@ class AsistenteHistologiaNeo4j:
                 
                 img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
                 
-                await self.neo4j.upsert_imagen(
+                await self.qdrant_store.upsert_imagen(
                     imagen_id=img_id, path=img_path,
                     fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
                     ocr_text=img_info.get("ocr_text", ""),
@@ -2008,15 +2115,14 @@ class AsistenteHistologiaNeo4j:
                 img_id = f"img_extra_{os.path.basename(img_path)}"
                 emb_u = self.uni.embed_image(img_path)
                 emb_p = self.plip.embed_image(img_path)
-                await self.neo4j.upsert_imagen(
+                await self.qdrant_store.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
                     pagina=0, ocr_text=ocr[:300], emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
                 )
             except Exception as e:
                 print(f"  ❌ Imagen extra {img_path}: {e}")
 
-        await self.neo4j.crear_relaciones_similitud(SIMILAR_IMG_THRESHOLD)
-        print("✅ Indexación Neo4j completada")
+        print("✅ Indexación Qdrant completada")
 
     # ------------------------------------------------------------------
     # Punto de entrada público
@@ -2033,7 +2139,7 @@ class AsistenteHistologiaNeo4j:
         tiene_imagen_activa = self.memoria.tiene_imagen_previa() or bool(imagen_path)
 
         print(f"\n{'='*70}")
-        print(f"🔬 RAG Histología Neo4j v4.1 | umbral={self.SIMILARITY_THRESHOLD}")
+        print(f"🔬 RAG Histología Qdrant v5.0 | umbral={self.SIMILARITY_THRESHOLD}")
         print(f"   Texto:         {consulta_texto}")
         print(f"   Imagen turno:  {imagen_path or 'ninguna'}")
         print(f"   Imagen activa: {imagen_activa or 'ninguna'}")
@@ -2057,8 +2163,8 @@ class AsistenteHistologiaNeo4j:
 
         config = {
             "configurable": {"thread_id": user_id},
-            "run_name":     f"consulta-neo4j-v4.1-{user_id}",
-            "tags":         ["rag", "histologia", "neo4j", "imagebind", "v4.1"],
+            "run_name":     f"consulta-qdrant-v5.0-{user_id}",
+            "tags":         ["rag", "histologia", "qdrant", "v5.0"],
             "metadata": {
                 "tiene_imagen_nueva":  imagen_path is not None,
                 "tiene_imagen_activa": tiene_imagen_activa,
@@ -2079,8 +2185,8 @@ class AsistenteHistologiaNeo4j:
         return respuesta
 
     async def cerrar(self):
-        if self.neo4j:
-            await self.neo4j.close()
+        if self.qdrant_store:
+            await self.qdrant_store.close()
 
 
 # =============================================================================
@@ -2088,7 +2194,7 @@ class AsistenteHistologiaNeo4j:
 # =============================================================================
 
 async def modo_interactivo(reindex: bool = False, force: bool = False):
-    asistente = AsistenteHistologiaNeo4j()
+    asistente = AsistenteHistologiaQdrant()
     await asistente.inicializar_componentes()
 
     print("\n🔄 Leyendo el manual...")
@@ -2098,15 +2204,15 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
     await asistente.extraer_y_preparar_temario()
     print(f"   → {len(asistente.extractor_temario.temas)} temas")
 
-    print("\n💾 Indexando en Neo4j...")
+    print("\n💾 Indexando en Qdrant...")
     if reindex:
-        await asistente.indexar_en_neo4j(DIRECTORIO_PDFS, forzar=force)
+        await asistente.indexar_en_qdrant(DIRECTORIO_PDFS, forzar=force)
     else:
         print("   (Saltando indexación — usar --reindex para forzar)")
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║   RAG Histología Neo4j + ImageBind v4.1 — Chat Interactivo  ║
+║   RAG Histología Qdrant v5.0 — Chat Interactivo             ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  • Escribí tu pregunta y presioná Enter                     ║
 ║  • Para subir una imagen: escribí el PATH cuando se pida    ║
@@ -2188,7 +2294,7 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reindex", action="store_true", help="Indexar en Neo4j (salta si ya hay datos)")
+    parser.add_argument("--reindex", action="store_true", help="Indexar en Qdrant (salta si ya hay datos)")
     parser.add_argument("--force", action="store_true", help="Forzar re-indexación aunque haya datos")
     args = parser.parse_args()
 
