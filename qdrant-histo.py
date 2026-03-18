@@ -372,7 +372,7 @@ class QdrantVectorStore:
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
             except Exception:
-                pass
+                pass  # Ya existe
         
         try:
             self.client.create_payload_index(
@@ -383,6 +383,15 @@ class QdrantVectorStore:
         except Exception:
             pass
 
+        # Índice numérico para filtrar por página
+        try:
+            self.client.create_payload_index(
+                collection_name=COLLECTION_CHUNKS,
+                field_name="pagina",
+                field_schema=models.PayloadSchemaType.INTEGER,
+            )
+        except Exception:
+            pass  # Ya existe
         print("✅ Esquema Qdrant listo (2 colecciones + índices de payload)")
 
     # ------------------------------------------------------------------
@@ -391,36 +400,42 @@ class QdrantVectorStore:
 
     async def upsert_chunk(self, chunk_id: str, texto: str, fuente: str,
                             chunk_idx: int, embedding: List[float],
-                            entidades: Dict[str, List[str]]):
+                            entidades: Dict[str, List[str]],
+                            pagina: int = 0,
+                            imagenes_pagina: Optional[List[str]] = None):
         point = PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)),
             vector=embedding,
             payload={
-                "chunk_id":     chunk_id,
-                "texto":        texto,
-                "fuente":       fuente,
-                "chunk_idx":    chunk_idx,
-                "tipo":         "texto",
-                "tejidos":      entidades.get("tejidos", []),
-                "estructuras":  entidades.get("estructuras", []),
-                "tinciones":    entidades.get("tinciones", []),
+                "chunk_id":         chunk_id,
+                "texto":            texto,
+                "fuente":           fuente,
+                "chunk_idx":        chunk_idx,
+                "pagina":           pagina,
+                "imagenes_pagina":  imagenes_pagina or [],
+                "tipo":             "texto",
+                "tejidos":          entidades.get("tejidos", []),
+                "estructuras":      entidades.get("estructuras", []),
+                "tinciones":        entidades.get("tinciones", []),
             },
         )
         self.client.upsert(collection_name=COLLECTION_CHUNKS, points=[point])
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str,
-                             emb_uni: List[float], emb_plip: List[float]):
+                             emb_uni: List[float], emb_plip: List[float],
+                             texto_pagina: str = ""):
         point = PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, imagen_id)),
             vector={"uni": emb_uni, "plip": emb_plip},
             payload={
-                "imagen_id": imagen_id,
-                "path":      path,
-                "fuente":    fuente,
-                "pagina":    pagina,
-                "ocr_text":  ocr_text,
-                "tipo":      "imagen",
+                "imagen_id":     imagen_id,
+                "path":          path,
+                "fuente":        fuente,
+                "pagina":        pagina,
+                "ocr_text":      ocr_text,
+                "texto_pagina":  texto_pagina[:2000],
+                "tipo":          "imagen",
             },
         )
         self.client.upsert(collection_name=COLLECTION_IMAGENES, points=[point])
@@ -439,12 +454,14 @@ class QdrantVectorStore:
             ).points
             return [
                 {
-                    "id":          str(r.id),
-                    "texto":       r.payload.get("texto", ""),
-                    "fuente":      r.payload.get("fuente", ""),
-                    "tipo":        "texto",
-                    "imagen_path": None,
-                    "similitud":   r.score,
+                    "id":               str(r.id),
+                    "texto":            r.payload.get("texto", ""),
+                    "fuente":           r.payload.get("fuente", ""),
+                    "tipo":             "texto",
+                    "pagina":           r.payload.get("pagina"),
+                    "imagenes_pagina":  r.payload.get("imagenes_pagina", []),
+                    "imagen_path":      None,
+                    "similitud":        r.score,
                 }
                 for r in results
             ]
@@ -468,6 +485,8 @@ class QdrantVectorStore:
                     "fuente":      r.payload.get("fuente", ""),
                     "tipo":        "imagen",
                     "imagen_path": r.payload.get("path"),
+                    "pagina":      r.payload.get("pagina"),
+                    "texto_pagina": r.payload.get("texto_pagina", ""),
                     "similitud":   r.score,
                 }
                 for r in results
@@ -511,6 +530,34 @@ class QdrantVectorStore:
             ]
         except Exception as e:
             print(f"⚠️ Error búsqueda entidades: {e}")
+            return []
+
+    async def busqueda_por_pagina(self, fuente: str, pagina: int,
+                                  top_k: int = 5) -> List[Dict]:
+        """Devuelve chunks de texto de una página específica de un PDF."""
+        try:
+            results, _ = self.client.scroll(
+                collection_name=COLLECTION_CHUNKS,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="fuente", match=MatchValue(value=fuente)),
+                    FieldCondition(key="pagina", match=MatchValue(value=pagina)),
+                ]),
+                limit=top_k,
+            )
+            return [
+                {
+                    "id":          str(r.id),
+                    "texto":       r.payload.get("texto", ""),
+                    "fuente":      r.payload.get("fuente", ""),
+                    "tipo":        "texto",
+                    "pagina":      r.payload.get("pagina"),
+                    "imagen_path": None,
+                    "similitud":   0.45,
+                }
+                for r in results
+            ]
+        except Exception as e:
+            print(f"⚠️ Error búsqueda por página ({fuente} p{pagina}): {e}")
             return []
 
     async def expandir_vecindad(self, resultados_top: List[Dict],
@@ -595,6 +642,18 @@ class QdrantVectorStore:
         # 4. Entidades (filtro por payload)
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
 
+        # 5. Chunks co-ubicados: buscar texto de las mismas páginas que las imágenes encontradas
+        res_pag = []
+        paginas_encontradas = set()
+        for r in res_uni + res_plip:
+            if r.get("tipo") == "imagen" and r.get("pagina") and r.get("fuente"):
+                paginas_encontradas.add((r["fuente"], r["pagina"]))
+        for fuente, pagina in list(paginas_encontradas)[:5]:
+            chunks_pagina = await self.busqueda_por_pagina(fuente, pagina)
+            res_pag.extend(chunks_pagina)
+        if res_pag:
+            print(f"   📄 Co-ubicados: {len(res_pag)} chunks de {len(paginas_encontradas)} páginas")
+
         # Vecindad sobre los mejores
         todos = res_texto + res_uni + res_plip
         top_results = todos[:6]
@@ -619,12 +678,14 @@ class QdrantVectorStore:
         agregar(res_uni,   0.20)  # UNI complemento visual
         agregar(res_plip,  0.20)  # PLIP complemento visual
         agregar(res_ent,   0.35)  # Entidades (filtro payload)
+        agregar(res_pag,   0.30)  # Co-ubicados (texto de misma página que imagen)
         agregar(res_vec,   0.10)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
         print(f"   📊 Híbrida: Txt={len(res_texto)} | "
-              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
+              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
+              f"Pag={len(res_pag)} | Vec={len(res_vec)} -> {len(final)}")
 
         return final[:15]
 
@@ -1718,22 +1779,39 @@ class AsistenteHistologiaQdrant:
         vistas: set = set()
         imagenes_unicas: List[str] = []
         for r in validos:
+            # Imágenes directas de resultados tipo imagen
             img_path = r.get("imagen_path")
             if img_path and os.path.exists(img_path) and img_path not in vistas:
                 vistas.add(img_path)
                 imagenes_unicas.append(img_path)
+            # Imágenes cross-referenciadas desde chunks de texto (misma página)
+            for img_ref in r.get("imagenes_pagina", []):
+                if img_ref and os.path.exists(img_ref) and img_ref not in vistas:
+                    vistas.add(img_ref)
+                    imagenes_unicas.append(img_ref)
         state["imagenes_recuperadas"] = imagenes_unicas
 
         if validos:
             validos_sorted = sorted(validos, key=lambda x: x.get("similitud", 0), reverse=True)
             bloques = []
             for i, r in enumerate(validos_sorted, 1):
+                pag = r.get("pagina")
                 enc = (f"[Sección {i} | Fuente: {r.get('fuente','N/A')} | "
                        f"Tipo: {r.get('tipo','?')} | Sim: {r.get('similitud',0):.3f}")
+                if pag:
+                    enc += f" | Pág: {pag}"
                 if r.get("imagen_path"):
                     enc += f" | Imagen: {os.path.basename(r['imagen_path'])}"
+                imgs_pag = r.get("imagenes_pagina", [])
+                if imgs_pag:
+                    nombres = [os.path.basename(p) for p in imgs_pag]
+                    enc += f" | Imgs misma pág: {', '.join(nombres)}"
                 enc += "]"
-                bloques.append(f"{enc}\n{_safe(r.get('texto',''))[:700]}")
+                # Para resultados tipo imagen, usar texto_pagina si disponible
+                texto_ctx = _safe(r.get("texto", ""))
+                if r.get("tipo") == "imagen" and r.get("texto_pagina"):
+                    texto_ctx = f"{texto_ctx}\n[Texto de la misma página:]\n{r['texto_pagina'][:1200]}"
+                bloques.append(f"{enc}\n{texto_ctx[:1500]}")
             state["contexto_documentos"] = "\n\n".join(bloques)
             print(f"✅ {len(validos)} válidos | {len(imagenes_unicas)} imágenes")
         else:
@@ -2024,6 +2102,17 @@ class AsistenteHistologiaQdrant:
             print(f"⚠️ Error leyendo {path}: {e}")
             return ""
 
+    def _leer_pdf_por_pagina(self, path: str) -> List[Tuple[int, str]]:
+        """Devuelve [(pagina, texto), ...] para cada página del PDF."""
+        try:
+            doc = fitz.open(path)
+            paginas = [(i + 1, page.get_text()) for i, page in enumerate(doc)]
+            doc.close()
+            return paginas
+        except Exception as e:
+            print(f"⚠️ Error leyendo {path}: {e}")
+            return []
+
     def _chunks(self, texto: str, size: int = 500) -> List[str]:
         return [texto[i:i+size] for i in range(0, len(texto), size)]
 
@@ -2062,26 +2151,51 @@ class AsistenteHistologiaQdrant:
             except Exception as e:
                 print(f"⚠️ No se pudo verificar estado de la BD: {e}")
 
-        print("📄 Indexando chunks de texto en Qdrant...")
+        # ── PASO 1: Extraer imágenes PRIMERO para construir mapa página→imágenes ──
+        print("📸 Extrayendo imágenes de PDFs...")
+        imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
+
+        # Construir mapa: (fuente, pagina) → [paths de imágenes]
+        from collections import defaultdict
+        mapa_imagenes_pagina: Dict[tuple, List[str]] = defaultdict(list)
+        for img_info in imagenes_pdf:
+            key = (img_info["fuente_pdf"], img_info["pagina"])
+            mapa_imagenes_pagina[key].append(img_info["path"])
+        print(f"   📋 Mapa construido: {len(mapa_imagenes_pagina)} páginas con imágenes")
+
+        # Construir mapa: (fuente, pagina) → texto_pagina (para enriquecer imágenes)
+        mapa_texto_pagina: Dict[tuple, str] = {}
+
+        # ── PASO 2: Indexar chunks de texto con referencias a imágenes ──
+        print("📄 Indexando chunks de texto en Qdrant (por página)...")
         for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
             fuente = os.path.basename(pdf_path)
-            texto  = self._leer_pdf(pdf_path)
-            chunks = self._chunks(texto)
-            print(f"  {fuente}: {len(chunks)} chunks")
-            for i, chunk in enumerate(chunks):
-                try:
-                    emb       = self._embed_texto_gemini(chunk)
-                    chunk_id  = f"chunk_{fuente}_{i}"
-                    entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
-                    await self.qdrant_store.upsert_chunk(
-                        chunk_id=chunk_id, texto=chunk, fuente=fuente,
-                        chunk_idx=i, embedding=emb, entidades=entidades
-                    )
-                except Exception as e:
-                    print(f"  ⚠️ Chunk {i}: {e}")
+            paginas = self._leer_pdf_por_pagina(pdf_path)
+            chunk_global = 0
+            for pagina_num, texto_pagina in paginas:
+                # Guardar texto de página para enriquecer imágenes después
+                mapa_texto_pagina[(fuente, pagina_num)] = texto_pagina
+                # Obtener imágenes de esta misma página
+                imgs_esta_pagina = mapa_imagenes_pagina.get((fuente, pagina_num), [])
+                chunks_pagina = self._chunks(texto_pagina)
+                for i, chunk in enumerate(chunks_pagina):
+                    try:
+                        emb       = self._embed_texto_gemini(chunk)
+                        chunk_id  = f"chunk_{fuente}_{pagina_num}_{i}"
+                        entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
+                        await self.qdrant_store.upsert_chunk(
+                            chunk_id=chunk_id, texto=chunk, fuente=fuente,
+                            chunk_idx=chunk_global, pagina=pagina_num,
+                            embedding=emb, entidades=entidades,
+                            imagenes_pagina=imgs_esta_pagina
+                        )
+                        chunk_global += 1
+                    except Exception as e:
+                        print(f"  ⚠️ Chunk p{pagina_num}/{i}: {e}")
+            print(f"  {fuente}: {chunk_global} chunks ({len(paginas)} páginas)")
 
-        print("📸 Indexando imágenes de PDFs en Qdrant...")
-        imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
+        # ── PASO 3: Indexar imágenes con texto de su página ──
+        print("📸 Indexando imágenes en Qdrant (con texto de página)...")
         for img_info in imagenes_pdf:
             img_path = img_info["path"]
             if not os.path.exists(img_path):
@@ -2089,15 +2203,18 @@ class AsistenteHistologiaQdrant:
             try:
                 emb_u  = self.uni.embed_image(img_path)
                 emb_p  = self.plip.embed_image(img_path)
-                
                 img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
-                
+                # Obtener texto de la misma página
+                texto_pag = mapa_texto_pagina.get(
+                    (img_info["fuente_pdf"], img_info["pagina"]), ""
+                )
                 await self.qdrant_store.upsert_imagen(
                     imagen_id=img_id, path=img_path,
                     fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
                     ocr_text=img_info.get("ocr_text", ""),
                     emb_uni=emb_u.tolist(),
-                    emb_plip=emb_p.tolist()
+                    emb_plip=emb_p.tolist(),
+                    texto_pagina=texto_pag
                 )
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
