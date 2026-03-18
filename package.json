@@ -1,7 +1,7 @@
 {
-  "name": "rag-histologia-neo4j-fullstack",
-  "version": "4.1.0",
-  "description": "Fullstack Histology RAG with Neo4j + A2UI",
+  "name": "rag-histologia-qdrant",
+  "version": "5.0.0",
+  "description": "RAG Multimodal de Histología con Qdrant + A2UI",
   "scripts": {
     "dev": "uv run uvicorn server:app --reload --host 0.0.0.0 --port 10005",
     "start": "uv run python server.py"
