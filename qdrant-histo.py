@@ -1,21 +1,22 @@
 # =============================================================================
-# RAG Multimodal de Histología con Qdrant — VERSIÓN 5.0
+# RAG Multimodal de Histología con Qdrant — VERSIÓN 5.1
 # =============================================================================
-# Cambios sobre v4.0:
-#   1. RAGAS eliminado completamente (clase MetricasRAGAS, imports, nodo
-#      evaluar_ragas, campo ground_truth, comando reporte).
-#   2. MEMORIA DE IMAGEN PERSISTENTE: la imagen se recuerda entre turnos.
-#      Si el usuario no sube imagen nueva, se reutiliza la del turno anterior.
-#      Comando "nueva imagen" para limpiarla explícitamente.
-#   3. CLASIFICADOR SEMÁNTICO: reemplaza verificación por keywords. Combina
-#      embedding ImageBind + razonamiento LLM. Entiende "¿de qué tejido se
-#      trata?" sin mencionar palabras del temario.
-#   4. MEMORIA SIEMPRE ACTUALIZADA: se guarda la interacción aunque el RAG
-#      no encuentre contexto suficiente.
-#   5. MODO INTERACTIVO MEJORADO: flujo natural de chat, imagen opcional en
-#      cada turno, sin prompts redundantes.
-#   6. Todos los fixes heredados de v3.1/v4.0 se mantienen:
-#      _safe(), deduplicación con loop explícito, _nodo_analisis_comparativo.
+# Cambios sobre v5.0:
+#   INDEXACIÓN Y RECUPERACIÓN IMAGEN↔TEXTO UNIFICADA
+#   1. `busqueda_vectorial_imagen` retorna `texto_pagina` en el resultado.
+#   2. `_nodo_filtrar_contexto` incluye `texto_pagina` al construir el bloque
+#      de contexto para cada imagen recuperada.
+#   3. `_nodo_generar_respuesta` pasa el `texto_pagina` al LLM junto con la imagen.
+#   4. `upsert_imagen` ahora también indexa un vector de texto (Gemini) opcional
+#      construido a partir de ocr_text + texto_pagina, para que una búsqueda de
+#      texto pueda recuperar directamente nodos de imagen enriquecidos.
+#   5. `busqueda_hibrida` agrega una búsqueda vectorial de texto sobre
+#      COLLECTION_IMAGENES (usando el nuevo vector "texto_emb"), de modo que
+#      al buscar por texto también se recuperan las imágenes cuyo texto de
+#      página coincide semánticamente.
+#   6. El mapa página→imagen se construye antes de indexar los chunks, y cada
+#      chunk guarda las rutas absolutas de las imágenes de su página (ya existía
+#      en v5.0 pero se refuerza con validación de existencia).
 # =============================================================================
 
 import os
@@ -82,7 +83,6 @@ nest_asyncio.apply()
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
-# CONFIGURACIÓN GLOBAL
 SIMILARITY_THRESHOLD  = 0.25
 # Dimensiones de embeddings
 DIM_TEXTO_GEMINI = 3072
@@ -94,9 +94,9 @@ DIRECTORIO_PDFS       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Colecciones Qdrant Cloud
 COLLECTION_CHUNKS   = "histo_chunks"       # Texto (Gemini)
-COLLECTION_IMAGENES = "histo_imagenes"     # Imágenes (UNI + PLIP)
+COLLECTION_IMAGENES = "histo_imagenes"     # Imágenes (UNI + PLIP + texto_emb)
 
-SIMILAR_IMG_THRESHOLD = 0.85 # Más alto para modelos especializados
+SIMILAR_IMG_THRESHOLD = 0.85
 
 FEATURES_DISCRIMINATORIAS = [
     "presencia/ausencia de lumen central",
@@ -272,16 +272,13 @@ class UniWrapper:
     def load(self):
         print("🔄 Cargando UNI (MahmoodLab)...")
         try:
-            # UNI usa timm con hf_hub
             self.model = timm.create_model(
-                "hf_hub:MahmoodLab/UNI", 
-                pretrained=True, 
-                init_values=1e-5, 
+                "hf_hub:MahmoodLab/UNI",
+                pretrained=True,
+                init_values=1e-5,
                 dynamic_img_size=True
             )
             self.model.to(self.device).eval()
-            
-            # Transformación estándar de UNI (ViT-L/16)
             from timm.data import resolve_data_config
             from timm.data.transforms_factory import create_transform
             config = resolve_data_config(self.model.pretrained_cfg, model=self.model)
@@ -296,7 +293,7 @@ class UniWrapper:
             image = Image.open(image_path).convert('RGB')
             image_tensor = self.transform(image).unsqueeze(0).to(self.device)
             with torch.inference_mode():
-                emb = self.model(image_tensor) # UNI returns raw features [1, 1024]
+                emb = self.model(image_tensor)
             return emb.cpu().numpy().flatten()
         except Exception as e:
             print(f"⚠️ Error embedding UNI: {e}")
@@ -304,17 +301,17 @@ class UniWrapper:
 
 
 # =============================================================================
-# VECTOR STORE QDRANT CLOUD (reemplaza Neo4j)
+# VECTOR STORE QDRANT CLOUD — v5.1
+# Cambios clave:
+#   • COLLECTION_IMAGENES ahora tiene un 4° vector nombrado "texto_emb" (Gemini
+#     3072d) construido desde ocr_text + texto_pagina. Esto permite buscar
+#     imágenes por similitud semántica de texto, igual que los chunks.
+#   • busqueda_vectorial_imagen devuelve texto_pagina en cada resultado.
+#   • busqueda_hibrida agrega res_img_texto: búsqueda vectorial de texto sobre
+#     COLLECTION_IMAGENES, con peso 0.30.
 # =============================================================================
 
 class QdrantVectorStore:
-    """
-    Wrapper para Qdrant Cloud que reemplaza a Neo4j.
-    Usa 2 colecciones:
-      - histo_chunks:   chunks de texto con embedding Gemini (3072)
-      - histo_imagenes: imágenes con embeddings UNI (1024) y PLIP (512)
-    Las entidades se almacenan como payload para filtrado.
-    """
 
     def __init__(self, url: str, api_key: str):
         self.url     = url
@@ -322,7 +319,6 @@ class QdrantVectorStore:
         self.client  = QdrantClient(url=url, api_key=api_key, timeout=60)
 
     async def connect(self):
-        # La conexión se establece al crear el client; verificamos con get_collections
         try:
             self.client.get_collections()
             print(f"✅ Qdrant Cloud conectado: {self.url}")
@@ -336,8 +332,9 @@ class QdrantVectorStore:
             pass
 
     async def crear_esquema(self):
-        print("🏗️ Creando esquema Qdrant Cloud (v5.0 UNI + PLIP)...")
-        # Colección de chunks (vector único de texto Gemini)
+        print("🏗️ Creando esquema Qdrant Cloud (v5.1 UNI + PLIP + texto_emb)...")
+
+        # ── Colección de chunks (vector único de texto Gemini) ──────────
         try:
             self.client.get_collection(COLLECTION_CHUNKS)
             print(f"   ✅ Colección '{COLLECTION_CHUNKS}' ya existe")
@@ -348,21 +345,35 @@ class QdrantVectorStore:
             )
             print(f"   ✅ Colección '{COLLECTION_CHUNKS}' creada")
 
-        # Colección de imágenes (vectores nombrados UNI + PLIP)
+        # ── Colección de imágenes (UNI + PLIP + texto_emb) ─────────────
+        # NUEVO en v5.1: añadimos "texto_emb" para búsqueda texto→imagen
         try:
-            self.client.get_collection(COLLECTION_IMAGENES)
-            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' ya existe")
+            col_info = self.client.get_collection(COLLECTION_IMAGENES)
+            existing_vectors = set(col_info.config.params.vectors.keys()
+                                   if hasattr(col_info.config.params.vectors, 'keys')
+                                   else [])
+            if "texto_emb" not in existing_vectors:
+                # La colección existe pero le falta el vector texto_emb.
+                # En Qdrant Cloud no se puede agregar un vector a una colección existente
+                # sin recrearla. Avisamos al usuario.
+                print(f"   ⚠️ Colección '{COLLECTION_IMAGENES}' existe pero le falta el vector "
+                      f"'texto_emb'. Para habilitar búsqueda texto→imagen deberás recrearla "
+                      f"(--reindex --force).")
+            else:
+                print(f"   ✅ Colección '{COLLECTION_IMAGENES}' ya existe (con texto_emb)")
         except Exception:
             self.client.create_collection(
                 collection_name=COLLECTION_IMAGENES,
                 vectors_config={
-                    "uni":  VectorParams(size=DIM_IMG_UNI,  distance=Distance.COSINE),
-                    "plip": VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
+                    "uni":       VectorParams(size=DIM_IMG_UNI,      distance=Distance.COSINE),
+                    "plip":      VectorParams(size=DIM_IMG_PLIP,     distance=Distance.COSINE),
+                    # NUEVO: embedding textual de ocr_text + texto_pagina
+                    "texto_emb": VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
                 },
             )
-            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' creada")
+            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' creada (con texto_emb)")
 
-        # ── Índices de Payload (necesarios para filtrado MatchAny/MatchValue) ──
+        # ── Índices de Payload ──────────────────────────────────────────
         print("   🔍 Creando índices de payload...")
         for field in ["tejidos", "estructuras", "tinciones", "fuente"]:
             try:
@@ -372,18 +383,18 @@ class QdrantVectorStore:
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
             except Exception:
-                pass  # Ya existe
-        
-        try:
-            self.client.create_payload_index(
-                collection_name=COLLECTION_IMAGENES,
-                field_name="fuente",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-        except Exception:
-            pass
+                pass
 
-        # Índice numérico para filtrar por página
+        for field in ["fuente", "pagina_str"]:
+            try:
+                self.client.create_payload_index(
+                    collection_name=COLLECTION_IMAGENES,
+                    field_name=field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                pass
+
         try:
             self.client.create_payload_index(
                 collection_name=COLLECTION_CHUNKS,
@@ -391,7 +402,8 @@ class QdrantVectorStore:
                 field_schema=models.PayloadSchemaType.INTEGER,
             )
         except Exception:
-            pass  # Ya existe
+            pass
+
         print("✅ Esquema Qdrant listo (2 colecciones + índices de payload)")
 
     # ------------------------------------------------------------------
@@ -412,7 +424,8 @@ class QdrantVectorStore:
                 "fuente":           fuente,
                 "chunk_idx":        chunk_idx,
                 "pagina":           pagina,
-                "imagenes_pagina":  imagenes_pagina or [],
+                # Solo guardar rutas que existen en disco al momento de indexar
+                "imagenes_pagina":  [p for p in (imagenes_pagina or []) if os.path.exists(p)],
                 "tipo":             "texto",
                 "tejidos":          entidades.get("tejidos", []),
                 "estructuras":      entidades.get("estructuras", []),
@@ -424,17 +437,37 @@ class QdrantVectorStore:
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str,
                              emb_uni: List[float], emb_plip: List[float],
+                             # NUEVO v5.1: embedding textual precalculado
+                             emb_texto: Optional[List[float]] = None,
                              texto_pagina: str = ""):
+        """
+        Indexa una imagen con tres vectores:
+          • uni / plip  → similitud visual histológica
+          • texto_emb   → similitud semántica del texto de la página (NUEVO)
+        Si emb_texto es None se genera un vector cero (fallback sin Gemini).
+        """
+        vectors: Dict[str, List[float]] = {
+            "uni":  emb_uni,
+            "plip": emb_plip,
+        }
+        # Solo agregar texto_emb si la colección lo soporta (vector no-cero)
+        if emb_texto and any(v != 0.0 for v in emb_texto):
+            vectors["texto_emb"] = emb_texto
+        else:
+            # Vector cero como placeholder: Qdrant lo ignora en búsquedas coseno
+            vectors["texto_emb"] = [0.0] * DIM_TEXTO_GEMINI
+
         point = PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, imagen_id)),
-            vector={"uni": emb_uni, "plip": emb_plip},
+            vector=vectors,
             payload={
                 "imagen_id":     imagen_id,
                 "path":          path,
                 "fuente":        fuente,
                 "pagina":        pagina,
+                "pagina_str":    str(pagina),   # índice keyword para filtros
                 "ocr_text":      ocr_text,
-                "texto_pagina":  texto_pagina[:2000],
+                "texto_pagina":  texto_pagina[:3000],  # más largo que v5.0 (era 2000)
                 "tipo":          "imagen",
             },
         )
@@ -461,6 +494,7 @@ class QdrantVectorStore:
                     "pagina":           r.payload.get("pagina"),
                     "imagenes_pagina":  r.payload.get("imagenes_pagina", []),
                     "imagen_path":      None,
+                    "texto_pagina":     "",          # chunks no tienen texto_pagina separado
                     "similitud":        r.score,
                 }
                 for r in results
@@ -471,6 +505,10 @@ class QdrantVectorStore:
 
     async def busqueda_vectorial_imagen(self, embedding: List[float],
                                          using: str, top_k: int = 10) -> List[Dict]:
+        """
+        Busca imágenes por similitud visual (uni/plip) o textual (texto_emb).
+        NUEVO v5.1: siempre retorna texto_pagina en el resultado.
+        """
         try:
             results = self.client.query_points(
                 collection_name=COLLECTION_IMAGENES,
@@ -480,14 +518,16 @@ class QdrantVectorStore:
             ).points
             return [
                 {
-                    "id":          str(r.id),
-                    "texto":       r.payload.get("ocr_text", ""),
-                    "fuente":      r.payload.get("fuente", ""),
-                    "tipo":        "imagen",
-                    "imagen_path": r.payload.get("path"),
-                    "pagina":      r.payload.get("pagina"),
+                    "id":           str(r.id),
+                    # Para el contexto del LLM: preferir texto_pagina sobre ocr_text
+                    "texto":        r.payload.get("ocr_text", ""),
+                    "fuente":       r.payload.get("fuente", ""),
+                    "tipo":         "imagen",
+                    "imagen_path":  r.payload.get("path"),
+                    "pagina":       r.payload.get("pagina"),
+                    # CLAVE: texto de la página del PDF asociado a esta imagen
                     "texto_pagina": r.payload.get("texto_pagina", ""),
-                    "similitud":   r.score,
+                    "similitud":    r.score,
                 }
                 for r in results
             ]
@@ -519,12 +559,15 @@ class QdrantVectorStore:
             )
             return [
                 {
-                    "id":          str(r.id),
-                    "texto":       r.payload.get("texto", ""),
-                    "fuente":      r.payload.get("fuente", ""),
-                    "tipo":        "texto",
-                    "imagen_path": None,
-                    "similitud":   0.5,
+                    "id":              str(r.id),
+                    "texto":           r.payload.get("texto", ""),
+                    "fuente":          r.payload.get("fuente", ""),
+                    "tipo":            "texto",
+                    "pagina":          r.payload.get("pagina"),
+                    "imagenes_pagina": r.payload.get("imagenes_pagina", []),
+                    "imagen_path":     None,
+                    "texto_pagina":    "",
+                    "similitud":       0.5,
                 }
                 for r in results
             ]
@@ -534,7 +577,6 @@ class QdrantVectorStore:
 
     async def busqueda_por_pagina(self, fuente: str, pagina: int,
                                   top_k: int = 5) -> List[Dict]:
-        """Devuelve chunks de texto de una página específica de un PDF."""
         try:
             results, _ = self.client.scroll(
                 collection_name=COLLECTION_CHUNKS,
@@ -546,13 +588,15 @@ class QdrantVectorStore:
             )
             return [
                 {
-                    "id":          str(r.id),
-                    "texto":       r.payload.get("texto", ""),
-                    "fuente":      r.payload.get("fuente", ""),
-                    "tipo":        "texto",
-                    "pagina":      r.payload.get("pagina"),
-                    "imagen_path": None,
-                    "similitud":   0.45,
+                    "id":              str(r.id),
+                    "texto":           r.payload.get("texto", ""),
+                    "fuente":          r.payload.get("fuente", ""),
+                    "tipo":            "texto",
+                    "pagina":          r.payload.get("pagina"),
+                    "imagenes_pagina": r.payload.get("imagenes_pagina", []),
+                    "imagen_path":     None,
+                    "texto_pagina":    "",
+                    "similitud":       0.45,
                 }
                 for r in results
             ]
@@ -562,7 +606,6 @@ class QdrantVectorStore:
 
     async def expandir_vecindad(self, resultados_top: List[Dict],
                                  top_k: int = 10) -> List[Dict]:
-        """Busca más chunks e imágenes de las mismas fuentes que los top results."""
         if not resultados_top:
             return []
 
@@ -585,7 +628,9 @@ class QdrantVectorStore:
                         vecinos.append({
                             "id": rid, "texto": r.payload.get("texto", ""),
                             "fuente": r.payload.get("fuente", ""), "tipo": "texto",
-                            "imagen_path": None, "similitud": 0.3,
+                            "pagina": r.payload.get("pagina"),
+                            "imagenes_pagina": r.payload.get("imagenes_pagina", []),
+                            "imagen_path": None, "texto_pagina": "", "similitud": 0.3,
                         })
             except Exception:
                 pass
@@ -604,7 +649,11 @@ class QdrantVectorStore:
                         vecinos.append({
                             "id": rid, "texto": r.payload.get("ocr_text", ""),
                             "fuente": r.payload.get("fuente", ""), "tipo": "imagen",
-                            "imagen_path": r.payload.get("path"), "similitud": 0.3,
+                            "imagen_path": r.payload.get("path"),
+                            "pagina": r.payload.get("pagina"),
+                            # NUEVO: traer texto_pagina también en vecindad
+                            "texto_pagina": r.payload.get("texto_pagina", ""),
+                            "similitud": 0.3,
                         })
             except Exception:
                 pass
@@ -612,7 +661,8 @@ class QdrantVectorStore:
         return vecinos[:top_k]
 
     # ------------------------------------------------------------------
-    # Búsqueda híbrida (punto de entrada principal)
+    # Búsqueda híbrida — v5.1
+    # Añade res_img_texto: busca imágenes por su texto_emb (Gemini).
     # ------------------------------------------------------------------
 
     async def busqueda_hibrida(self,
@@ -621,13 +671,15 @@ class QdrantVectorStore:
                                 imagen_embedding_plip: Optional[List[float]],
                                 entidades: Dict[str, List[str]],
                                 top_k: int = 10) -> List[Dict]:
-        res_texto = []
-        res_uni   = []
-        res_plip  = []
-        res_ent   = []
-        res_vec   = []
+        res_texto     = []
+        res_uni       = []
+        res_plip      = []
+        res_ent       = []
+        res_vec       = []
+        res_pag       = []
+        res_img_texto = []   # NUEVO v5.1: texto→imagen
 
-        # 1. Búsqueda Texto (Gemini)
+        # 1. Búsqueda Texto en chunks (Gemini)
         if texto_embedding:
             res_texto = await self.busqueda_vectorial_texto(texto_embedding, top_k)
 
@@ -639,13 +691,27 @@ class QdrantVectorStore:
         if imagen_embedding_plip:
             res_plip = await self.busqueda_vectorial_imagen(imagen_embedding_plip, "plip", top_k)
 
-        # 4. Entidades (filtro por payload)
+        # 4. NUEVO v5.1: Búsqueda de texto sobre COLLECTION_IMAGENES (texto_emb)
+        #    Esto recupera imágenes cuyo texto de página es semánticamente similar
+        #    a la consulta, incluso sin haber subido una imagen de consulta.
+        if texto_embedding:
+            try:
+                res_img_texto = await self.busqueda_vectorial_imagen(
+                    texto_embedding, "texto_emb", top_k
+                )
+                # Filtrar vector-cero (imágenes sin texto_emb real)
+                res_img_texto = [r for r in res_img_texto if r.get("similitud", 0) > 0.05]
+            except Exception as e:
+                # La colección puede no tener el vector texto_emb (v5.0 legacy)
+                print(f"   ⚠️ texto_emb no disponible en COLLECTION_IMAGENES: {e}")
+                res_img_texto = []
+
+        # 5. Entidades (filtro por payload)
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
 
-        # 5. Chunks co-ubicados: buscar texto de las mismas páginas que las imágenes encontradas
-        res_pag = []
+        # 6. Chunks co-ubicados con imágenes (misma página)
         paginas_encontradas = set()
-        for r in res_uni + res_plip:
+        for r in res_uni + res_plip + res_img_texto:
             if r.get("tipo") == "imagen" and r.get("pagina") and r.get("fuente"):
                 paginas_encontradas.add((r["fuente"], r["pagina"]))
         for fuente, pagina in list(paginas_encontradas)[:5]:
@@ -654,11 +720,10 @@ class QdrantVectorStore:
         if res_pag:
             print(f"   📄 Co-ubicados: {len(res_pag)} chunks de {len(paginas_encontradas)} páginas")
 
-        # Vecindad sobre los mejores
-        todos = res_texto + res_uni + res_plip
-        top_results = todos[:6]
-        if top_results:
-            res_vec = await self.expandir_vecindad(top_results)
+        # 7. Vecindad sobre los mejores
+        todos = res_texto + res_uni + res_plip + res_img_texto
+        if todos:
+            res_vec = await self.expandir_vecindad(todos[:6])
 
         combined: Dict[str, Dict] = {}
 
@@ -672,20 +737,26 @@ class QdrantVectorStore:
                     combined[key] = {**r, "similitud": sim_ponderada}
                 else:
                     combined[key]["similitud"] += sim_ponderada
+                    # Preservar texto_pagina si el nuevo resultado lo tiene y el anterior no
+                    if r.get("texto_pagina") and not combined[key].get("texto_pagina"):
+                        combined[key]["texto_pagina"] = r["texto_pagina"]
+                    if r.get("imagenes_pagina") and not combined[key].get("imagenes_pagina"):
+                        combined[key]["imagenes_pagina"] = r["imagenes_pagina"]
 
-        # Pesos ajustados
-        agregar(res_texto, 0.40)  # Texto sigue siendo fundamental
-        agregar(res_uni,   0.20)  # UNI complemento visual
-        agregar(res_plip,  0.20)  # PLIP complemento visual
-        agregar(res_ent,   0.35)  # Entidades (filtro payload)
-        agregar(res_pag,   0.30)  # Co-ubicados (texto de misma página que imagen)
-        agregar(res_vec,   0.10)
+        agregar(res_texto,     0.40)
+        agregar(res_uni,       0.20)
+        agregar(res_plip,      0.20)
+        agregar(res_img_texto, 0.30)  # NUEVO: texto→imagen
+        agregar(res_ent,       0.35)
+        agregar(res_pag,       0.30)
+        agregar(res_vec,       0.10)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
-        print(f"   📊 Híbrida: Txt={len(res_texto)} | "
-              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
-              f"Pag={len(res_pag)} | Vec={len(res_vec)} -> {len(final)}")
+        print(f"   📊 Híbrida: Txt={len(res_texto)} | UNI={len(res_uni)} | "
+              f"PLIP={len(res_plip)} | ImgTxt={len(res_img_texto)} | "
+              f"Ent={len(res_ent)} | Pag={len(res_pag)} | Vec={len(res_vec)} "
+              f"-> {len(final)}")
 
         return final[:15]
 
@@ -711,13 +782,6 @@ class QdrantVectorStore:
 # =============================================================================
 
 class SemanticMemory:
-    """
-    Mantiene historial de conversación y la última imagen activa.
-    La imagen persiste entre turnos hasta que el usuario la cambie
-    explícitamente con el comando 'nueva imagen'.
-    Añade persistencia en Qdrant con vectores texto, UNI y PLIP.
-    """
-
     def __init__(self, llm, embeddings=None, uni=None, plip=None, max_entries: int = 10):
         self.llm            = llm
         self.embeddings     = embeddings
@@ -728,16 +792,13 @@ class SemanticMemory:
         self.summary        = ""
         self.direct_history = ""
 
-        # Persistencia de imagen entre turnos
         self.imagen_activa_path: Optional[str] = None
         self.imagen_turno_subida: int = 0
         self.turno_actual: int = 0
-        
-        # Qdrant init
+
         self.collection_name = "memoria_histo"
         self.qdrant = QdrantClient(path="./qdrant_memoria")
-        
-        # Si la colección no existe, se crea con vectores con nombre
+
         try:
             self.qdrant.get_collection(self.collection_name)
         except Exception:
@@ -746,13 +807,12 @@ class SemanticMemory:
                 collection_name=self.collection_name,
                 vectors_config={
                     "texto": VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
-                    "uni": VectorParams(size=DIM_IMG_UNI, distance=Distance.COSINE),
-                    "plip": VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
+                    "uni":   VectorParams(size=DIM_IMG_UNI,      distance=Distance.COSINE),
+                    "plip":  VectorParams(size=DIM_IMG_PLIP,     distance=Distance.COSINE),
                 }
             )
 
     def set_imagen(self, path: Optional[str]):
-        """Registra una nueva imagen activa. None = limpiar."""
         if path and os.path.exists(path):
             self.imagen_activa_path  = path
             self.imagen_turno_subida = self.turno_actual
@@ -770,13 +830,10 @@ class SemanticMemory:
         return self.get_imagen_activa() is not None
 
     def add_interaction(self, query: str, response: str):
-        """Guarda siempre la interacción, independientemente del resultado RAG."""
         self.turno_actual += 1
         self.conversations.append({
-            "query":    query,
-            "response": response,
-            "turno":    self.turno_actual,
-            "imagen":   self.imagen_activa_path
+            "query": query, "response": response,
+            "turno": self.turno_actual, "imagen": self.imagen_activa_path
         })
         if len(self.conversations) > self.max_entries:
             self.conversations.pop(0)
@@ -793,26 +850,20 @@ class SemanticMemory:
                     f"Asistente: {conv['response']}\n"
                 )
         self._update_summary()
-        
-        # Guardar en Qdrant cada 5 interacciones
+
         if self.turno_actual % 5 == 0 and len(self.conversations) > 0 and self.embeddings:
             self._guardar_memoria_qdrant()
 
     def _guardar_memoria_qdrant(self):
         print("   🧠 Generando resumen profundo para guardar en memoria (Qdrant)...")
         try:
-            # Resumir contexto reciente
             resp = invoke_con_reintento_sync(self.llm, [
                 SystemMessage(content="Genera un resumen detallado y técnico del siguiente historial de conversación sobre histología, destacando las entidades mencionadas y las conclusiones."),
                 HumanMessage(content=self.direct_history)
             ])
             resumen = resp.content
-            
-            # Embeddings del resumen textual
             emb_texto = embed_query_con_reintento(self.embeddings, resumen)
-            
-            # Embeddings visuales de la imagen activa en este bloque (si la hay)
-            emb_uni = [0.0] * DIM_IMG_UNI
+            emb_uni  = [0.0] * DIM_IMG_UNI
             emb_plip = [0.0] * DIM_IMG_PLIP
             if self.imagen_activa_path and os.path.exists(self.imagen_activa_path):
                 if self.uni:
@@ -822,22 +873,15 @@ class SemanticMemory:
 
             point = PointStruct(
                 id=str(uuid.uuid4()),
-                vector={
-                    "texto": emb_texto,
-                    "uni": emb_uni,
-                    "plip": emb_plip
-                },
+                vector={"texto": emb_texto, "uni": emb_uni, "plip": emb_plip},
                 payload={
-                    "resumen": resumen,
-                    "turno_fin": self.turno_actual,
+                    "resumen":      resumen,
+                    "turno_fin":    self.turno_actual,
                     "tiene_imagen": self.imagen_activa_path is not None,
-                    "imagen_path": self.imagen_activa_path
+                    "imagen_path":  self.imagen_activa_path
                 }
             )
-            self.qdrant.upsert(
-                collection_name=self.collection_name,
-                points=[point]
-            )
+            self.qdrant.upsert(collection_name=self.collection_name, points=[point])
             print("   ✅ Resumen guardado en Qdrant (memoria_histo)")
         except Exception as e:
             print(f"   ⚠️ Error guardando memoria en Qdrant: {e}")
@@ -857,24 +901,18 @@ class SemanticMemory:
 
     def get_context(self, query: str = "") -> str:
         ctx = self.summary.strip() or "No hay consultas previas."
-        
-        # Recuperar de Qdrant
         if query and self.embeddings:
             try:
                 emb_query = embed_query_con_reintento(self.embeddings, query)
                 resultados = self.qdrant.query_points(
                     collection_name=self.collection_name,
-                    query=emb_query,
-                    using="texto",
-                    limit=2
+                    query=emb_query, using="texto", limit=2
                 ).points
-                
-                memorias_recuperadas = [r.payload['resumen'] for r in resultados if r.score > 0.4]
-                if memorias_recuperadas:
-                    ctx += "\n\n[Memorias históricas recuperadas:]\n" + "\n- ".join(memorias_recuperadas)
+                memorias = [r.payload['resumen'] for r in resultados if r.score > 0.4]
+                if memorias:
+                    ctx += "\n\n[Memorias históricas recuperadas:]\n" + "\n- ".join(memorias)
             except Exception as e:
                 print(f"   ⚠️ Error recuperando memoria Qdrant: {e}")
-
         if self.imagen_activa_path:
             ctx += (f"\n\n[Imagen activa en el chat: "
                     f"{os.path.basename(self.imagen_activa_path)}]")
@@ -882,24 +920,18 @@ class SemanticMemory:
 
 
 # =============================================================================
-# CLASIFICADOR SEMÁNTICO — reemplaza verificación por keywords
+# CLASIFICADOR SEMÁNTICO
 # =============================================================================
 
 class ClasificadorSemantico:
-    """
-    Determina si una consulta pertenece al dominio histológico combinando:
-      1. Similitud coseno entre embedding ImageBind de la consulta y anclas semánticas.
-      2. Razonamiento LLM con contexto de imagen disponible.
-    """
-
     UMBRAL_SIMILITUD = 0.18
     UMBRAL_LLM       = 0.5
 
     def __init__(self, llm, embeddings, device: str, temario: List[str]):
-        self.llm       = llm
+        self.llm        = llm
         self.embeddings = embeddings
-        self.device    = device
-        self.temario   = temario
+        self.device     = device
+        self.temario    = temario
         self._anclas_emb: Optional[np.ndarray] = None
 
     def _embed_textos(self, textos: List[str]) -> np.ndarray:
@@ -921,32 +953,20 @@ class ClasificadorSemantico:
             print(f"   ⚠️ Error similitud semántica: {e}")
             return 0.0
 
-    async def clasificar(
-        self,
-        consulta: str,
-        analisis_visual: Optional[str] = None,
-        imagen_activa: bool = False,
-        temario_muestra: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        # Paso 1: Similitud ImageBind
+    async def clasificar(self, consulta: str, analisis_visual: Optional[str] = None,
+                          imagen_activa: bool = False,
+                          temario_muestra: Optional[List[str]] = None) -> Dict[str, Any]:
         sim = self.similitud_con_dominio(consulta)
         print(f"   📐 Similitud semántica con dominio histológico: {sim:.4f}")
-
         umbral_efectivo = self.UMBRAL_SIMILITUD * (0.6 if imagen_activa else 1.0)
 
         if sim >= umbral_efectivo:
-            return {
-                "valido":            True,
-                "tema_encontrado":   None,
-                "motivo":            f"Similitud ImageBind {sim:.3f} ≥ umbral {umbral_efectivo:.3f}",
-                "similitud_dominio": sim,
-                "metodo":            "semantico_imagebind"
-            }
+            return {"valido": True, "tema_encontrado": None,
+                    "motivo": f"Similitud {sim:.3f} ≥ umbral {umbral_efectivo:.3f}",
+                    "similitud_dominio": sim, "metodo": "semantico_imagebind"}
 
-        # Paso 2: LLM como árbitro
         muestra_temas = (temario_muestra or self.temario)[:60]
         temario_txt   = "\n".join(f"- {t}" for t in muestra_temas)
-
         context_extra = ""
         if analisis_visual:
             context_extra = f"\n\nANÁLISIS DE IMAGEN DISPONIBLE:\n{analisis_visual[:600]}"
@@ -980,27 +1000,16 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
             data      = json.loads(texto)
             confianza = float(data.get("confianza", 0.5))
             valido    = bool(data.get("valido", True))
-
             if not valido and imagen_activa and confianza < 0.7:
                 valido = True
                 data["motivo"] += " [aceptado por imagen activa]"
-
-            return {
-                "valido":            valido,
-                "tema_encontrado":   data.get("tema_encontrado"),
-                "motivo":            data.get("motivo", ""),
-                "similitud_dominio": sim,
-                "metodo":            "llm" if sim < umbral_efectivo * 0.5 else "combinado"
-            }
+            return {"valido": valido, "tema_encontrado": data.get("tema_encontrado"),
+                    "motivo": data.get("motivo", ""), "similitud_dominio": sim,
+                    "metodo": "llm" if sim < umbral_efectivo * 0.5 else "combinado"}
         except Exception as e:
             print(f"   ⚠️ Error clasificador LLM: {e}")
-            return {
-                "valido":            imagen_activa or sim > 0.10,
-                "tema_encontrado":   None,
-                "motivo":            f"Fallback: {e}",
-                "similitud_dominio": sim,
-                "metodo":            "fallback"
-            }
+            return {"valido": imagen_activa or sim > 0.10, "tema_encontrado": None,
+                    "motivo": f"Fallback: {e}", "similitud_dominio": sim, "metodo": "fallback"}
 
 
 # =============================================================================
@@ -1008,14 +1017,8 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
 # =============================================================================
 
 class ExtractorImagenesPDF:
-    """
-    Extrae imágenes individuales de PDFs usando PyMuPDF (fitz).
-    Método primario: get_image_info(xrefs=True) + extract_image(xref)
-    para extraer figuras reales en lugar de renderizar páginas completas.
-    Fallback: renderizado de página completa con pdf2image.
-    """
     RENDER_DPI = 200
-    MIN_IMAGE_SIZE = 150    # px mínimo ancho/alto para filtrar íconos
+    MIN_IMAGE_SIZE = 150
     MAX_IMAGE_SIZE = (1280, 1280)
 
     def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES):
@@ -1026,38 +1029,32 @@ class ExtractorImagenesPDF:
         imagenes = []
         nombre_pdf = os.path.splitext(os.path.basename(pdf_path))[0]
 
-        # ── Método primario: PyMuPDF (extrae imágenes individuales) ───
         try:
             doc = fitz.open(pdf_path)
             image_count = 0
-            seen_xrefs = set()       # Evitar duplicados por xref
-            seen_hashes = set()      # Evitar duplicados por contenido
+            seen_xrefs  = set()
+            seen_hashes = set()
 
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 valid_images_this_page = []
-
-                # get_image_info(xrefs=True) → solo imágenes dibujadas en esta página
                 img_info_list = page.get_image_info(xrefs=True)
-                page_xrefs = [info["xref"] for info in img_info_list if info.get("xref")]
-                # Deduplicar xrefs dentro de la misma página
-                page_xrefs = list(dict.fromkeys(page_xrefs))
+                page_xrefs    = list(dict.fromkeys(
+                    [info["xref"] for info in img_info_list if info.get("xref")]
+                ))
 
                 if page_xrefs:
                     for xref in page_xrefs:
-                        # Saltar xrefs ya procesados en páginas anteriores
                         if xref in seen_xrefs:
                             continue
                         seen_xrefs.add(xref)
                         try:
-                            base_image = doc.extract_image(xref)
+                            base_image  = doc.extract_image(xref)
                             if not base_image:
                                 continue
-
                             image_bytes = base_image["image"]
-                            ext = base_image["ext"]
+                            ext         = base_image["ext"]
 
-                            # Deduplicar por contenido (misma imagen en distintos xrefs)
                             import hashlib
                             img_hash = hashlib.md5(image_bytes).hexdigest()
                             if img_hash in seen_hashes:
@@ -1065,7 +1062,6 @@ class ExtractorImagenesPDF:
                             seen_hashes.add(img_hash)
 
                             image_count += 1
-
                             img_path = os.path.join(
                                 self.directorio_salida,
                                 f"{nombre_pdf}_p{page_num+1}_img{image_count}.{ext}"
@@ -1073,13 +1069,11 @@ class ExtractorImagenesPDF:
                             with open(img_path, "wb") as f:
                                 f.write(image_bytes)
 
-                            img_pil = Image.open(img_path)
+                            img_pil       = Image.open(img_path)
                             width, height = img_pil.size
-                            area = width * height
+                            area          = width * height
 
-                            # Filtro: descartar íconos diminutos
                             if width >= self.MIN_IMAGE_SIZE and height >= self.MIN_IMAGE_SIZE:
-                                # Convertir a RGB/JPG para consistencia
                                 if img_pil.mode != "RGB":
                                     img_pil = img_pil.convert("RGB")
                                 img_path_rgb = os.path.join(
@@ -1094,13 +1088,11 @@ class ExtractorImagenesPDF:
                                         pass
                                 img_path = img_path_rgb
 
-                                # Extraer texto de la página y OCR
                                 try:
                                     texto_pagina = page.get_text("text").strip()
-                                    import re
                                     texto_pagina = re.sub(r'\s+', ' ', texto_pagina)
-                                    ocr_img = pytesseract.image_to_string(img_pil).strip()[:200]
-                                    ocr_text = f"[{ocr_img}] {texto_pagina}"[:1500]
+                                    ocr_img  = pytesseract.image_to_string(img_pil).strip()[:300]
+                                    ocr_text = f"[OCR: {ocr_img}] [Página: {texto_pagina}]"[:1500]
                                 except Exception:
                                     ocr_text = ""
 
@@ -1113,16 +1105,13 @@ class ExtractorImagenesPDF:
                                     "area": area,
                                 })
                             else:
-                                # Imagen demasiado pequeña, eliminar
                                 try:
                                     os.remove(img_path)
                                 except OSError:
                                     pass
                         except Exception as e:
                             print(f"  ⚠️ Error xref {xref} pág {page_num+1}: {e}")
-
                 else:
-                    # Fallback por página: no hay xrefs → renderizar página completa
                     try:
                         page_imgs = convert_from_path(
                             pdf_path, first_page=page_num+1, last_page=page_num+1,
@@ -1136,16 +1125,13 @@ class ExtractorImagenesPDF:
                             )
                             page_imgs[0].save(img_path, "JPEG")
                             width, height = page_imgs[0].size
-
                             try:
                                 texto_pagina = page.get_text("text").strip()
-                                import re
                                 texto_pagina = re.sub(r'\s+', ' ', texto_pagina)
-                                ocr_img = pytesseract.image_to_string(page_imgs[0]).strip()[:200]
-                                ocr_text = f"[{ocr_img}] {texto_pagina}"[:1500]
+                                ocr_img  = pytesseract.image_to_string(page_imgs[0]).strip()[:300]
+                                ocr_text = f"[OCR: {ocr_img}] [Página: {texto_pagina}]"[:1500]
                             except Exception:
                                 ocr_text = ""
-
                             valid_images_this_page.append({
                                 "path": img_path,
                                 "fuente_pdf": os.path.basename(pdf_path),
@@ -1154,11 +1140,9 @@ class ExtractorImagenesPDF:
                                 "ocr_text": ocr_text,
                                 "area": width * height,
                             })
-                            print(f"      📸 Pág {page_num+1}: renderizada completa ({width}x{height})")
                     except Exception as e:
                         print(f"  ⚠️ Error renderizando pág {page_num+1}: {e}")
 
-                # Conservar SOLO la imagen más grande de la página
                 if valid_images_this_page:
                     largest = max(valid_images_this_page, key=lambda x: x["area"])
                     for img_data in valid_images_this_page:
@@ -1167,7 +1151,6 @@ class ExtractorImagenesPDF:
                                 os.remove(img_data["path"])
                             except OSError:
                                 pass
-                    # Quitar campo auxiliar 'area' antes de guardar
                     largest.pop("area", None)
                     imagenes.append(largest)
 
@@ -1182,7 +1165,6 @@ class ExtractorImagenesPDF:
         except Exception as e:
             print(f"  ⚠️ Error PyMuPDF ({e}), usando fallback de página completa...")
 
-        # ── Fallback global: renderizar todas las páginas ─────────────
         try:
             paginas = convert_from_path(pdf_path, dpi=self.RENDER_DPI)
         except Exception as e:
@@ -1191,7 +1173,7 @@ class ExtractorImagenesPDF:
 
         for num_pagina, pil_img in enumerate(paginas, start=1):
             nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.jpg"
-            ruta_completa = os.path.join(self.directorio_salida, nombre_archivo)
+            ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
             try:
                 pil_img.save(ruta_completa, format="JPEG")
                 try:
@@ -1333,7 +1315,7 @@ class AgentState(TypedDict):
     tiempo_inicio:               float
     analisis_visual:             Optional[str]
     tiene_imagen:                bool
-    imagen_es_nueva:             bool           # True si se subió en ESTE turno
+    imagen_es_nueva:             bool
     contexto_suficiente:         bool
     temario:                     List[str]
     tema_valido:                 bool
@@ -1346,7 +1328,7 @@ class AgentState(TypedDict):
 
 
 # =============================================================================
-# ASISTENTE PRINCIPAL v4.1
+# ASISTENTE PRINCIPAL v5.1
 # =============================================================================
 
 class AsistenteHistologiaQdrant:
@@ -1362,10 +1344,10 @@ class AsistenteHistologiaQdrant:
         self.memory_saver    = None
         self.contenido_base  = ""
 
-        self.uni   = None
-        self.plip  = None
-        self.embeddings = None  # Google Embeddings
-        self.embed_dim = DIM_TEXTO_GEMINI
+        self.uni        = None
+        self.plip       = None
+        self.embeddings = None
+        self.embed_dim  = DIM_TEXTO_GEMINI
 
         self.qdrant_store: Optional[QdrantVectorStore] = None
 
@@ -1379,35 +1361,25 @@ class AsistenteHistologiaQdrant:
             try:
                 cap = torch.cuda.get_device_capability(0)
                 if cap[0] < 7:
-                    print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]}). Forzando CPU para evitar fallback_error.")
+                    print(f"⚠️ GPU incompatible (sm_{cap[0]}{cap[1]}). Forzando CPU.")
                     self.device = "cpu"
-            except:
+            except Exception:
                 pass
-        print(f"✅ AsistenteHistologiaQdrant v5.0 inicializado en {self.device}")
+        print(f"✅ AsistenteHistologiaQdrant v5.1 inicializado en {self.device}")
 
     def _setup_apis(self):
         os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY") or ""
         print("✅ APIs configuradas")
 
-    # ------------------------------------------------------------------
-    # Inicialización
-    # ------------------------------------------------------------------
-
     async def inicializar_componentes(self):
         self._init_modelos()
-        self.memoria             = SemanticMemory(
-            llm=self.llm,
-            embeddings=self.embeddings,
-            uni=self.uni,
-            plip=self.plip
+        self.memoria = SemanticMemory(
+            llm=self.llm, embeddings=self.embeddings, uni=self.uni, plip=self.plip
         )
         self.extractor_temario   = ExtractorTemario(llm=self.llm)
         self.extractor_entidades = ExtractorEntidades(llm=self.llm)
         self.clasificador_semantico = ClasificadorSemantico(
-            llm=self.llm,
-            embeddings=self.embeddings, # Gemini
-            device=self.device,
-            temario=[]   # se actualizará tras extraer el temario
+            llm=self.llm, embeddings=self.embeddings, device=self.device, temario=[]
         )
 
         self.qdrant_store = QdrantVectorStore(
@@ -1429,8 +1401,7 @@ class AsistenteHistologiaQdrant:
             temperature=0, max_retries=1
         )
         print("✅ Groq inicializado")
-        
-        # Inicializar Embeddings (Gemini)
+
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model="models/gemini-embedding-001",
             google_api_key=userdata.get("GOOGLE_API_KEY"),
@@ -1438,18 +1409,17 @@ class AsistenteHistologiaQdrant:
         )
         print("✅ Embeddings Gemini inicializados")
 
-        # Cargar Modelos (UNI + PLIP)
         self.plip = PlipWrapper(self.device)
         self.plip.load()
-        
+
         self.uni = UniWrapper(self.device)
         self.uni.load()
 
     def _init_imagebind(self):
-        pass # ImageBind eliminado
+        pass
 
     # ------------------------------------------------------------------
-    # Grafo LangGraph v4.1
+    # Grafo LangGraph
     # ------------------------------------------------------------------
 
     def _crear_grafo(self):
@@ -1493,7 +1463,7 @@ class AsistenteHistologiaQdrant:
     # ------------------------------------------------------------------
 
     async def _nodo_inicializar(self, state: AgentState) -> AgentState:
-        print("📝 Inicializando flujo v5.0 (Qdrant)")
+        print("📝 Inicializando flujo v5.1 (Qdrant)")
         state["contexto_memoria"]            = self.memoria.get_context(state.get("consulta_texto", ""))
         state["contenido_base"]              = self.contenido_base
         state["tiempo_inicio"]               = time.time()
@@ -1511,16 +1481,10 @@ class AsistenteHistologiaQdrant:
         state["estructura_identificada"]     = None
         state["texto_embedding"]             = None
         state["similitud_semantica_dominio"] = 0.0
-        state["trayectoria"] = [{"nodo": "Inicializar", "tiempo": 0}]
+        state["trayectoria"]                 = [{"nodo": "Inicializar", "tiempo": 0}]
         return state
 
     async def _nodo_procesar_imagen(self, state: AgentState) -> AgentState:
-        """
-        Tres casos:
-          1. Imagen nueva este turno → procesarla y registrarla en memoria.
-          2. Sin imagen nueva pero hay activa en memoria → reutilizarla.
-          3. Sin imagen en ningún lado → modo texto puro.
-        """
         t0 = time.time()
         print("🖼️ Procesando imagen...")
 
@@ -1532,28 +1496,23 @@ class AsistenteHistologiaQdrant:
             imagen_es_nueva    = True
             self.memoria.set_imagen(imagen_path_activo)
             print(f"   🆕 Nueva imagen: {imagen_path_activo}")
-
         elif self.memoria.tiene_imagen_previa():
             imagen_path_activo = self.memoria.get_imagen_activa()
             state["imagen_path"] = imagen_path_activo
-            print(f"   ♻️  Reutilizando imagen del turno "
-                  f"{self.memoria.imagen_turno_subida}: "
+            print(f"   ♻️  Reutilizando imagen del turno {self.memoria.imagen_turno_subida}: "
                   f"{os.path.basename(imagen_path_activo)}")
-
         else:
             imagen_path_activo = None
 
         if imagen_path_activo and os.path.exists(imagen_path_activo):
             try:
-                # emb_c removed
                 emb_u = self.uni.embed_image(imagen_path_activo)
                 emb_p = self.plip.embed_image(imagen_path_activo)
-                
-                state["imagen_embedding_uni"]   = emb_u.tolist()
-                state["imagen_embedding_plip"]  = emb_p.tolist()
-                
-                state["tiene_imagen"]     = True
-                state["imagen_es_nueva"]  = imagen_es_nueva
+
+                state["imagen_embedding_uni"]  = emb_u.tolist()
+                state["imagen_embedding_plip"] = emb_p.tolist()
+                state["tiene_imagen"]          = True
+                state["imagen_es_nueva"]       = imagen_es_nueva
 
                 if imagen_es_nueva or not state.get("analisis_visual"):
                     state["analisis_visual"] = await self._describir_imagen_histologica(
@@ -1567,10 +1526,10 @@ class AsistenteHistologiaQdrant:
             except Exception as e:
                 print(f"❌ Error imagen: {e}")
                 import traceback; traceback.print_exc()
-                state["imagen_embedding_uni"]   = None
-                state["imagen_embedding_plip"]  = None
-                state["analisis_visual"]  = None
-                state["tiene_imagen"]     = False
+                state["imagen_embedding_uni"]  = None
+                state["imagen_embedding_plip"] = None
+                state["analisis_visual"]       = None
+                state["tiene_imagen"]          = False
         else:
             print("ℹ️ Sin imagen — modo texto")
             state["imagen_embedding"] = None
@@ -1579,10 +1538,8 @@ class AsistenteHistologiaQdrant:
             state["imagen_es_nueva"]  = False
 
         state["trayectoria"].append({
-            "nodo":            "ProcesarImagen",
-            "tiene_imagen":    state["tiene_imagen"],
-            "imagen_es_nueva": imagen_es_nueva,
-            "tiempo":          round(time.time()-t0, 2)
+            "nodo": "ProcesarImagen", "tiene_imagen": state["tiene_imagen"],
+            "imagen_es_nueva": imagen_es_nueva, "tiempo": round(time.time()-t0, 2)
         })
         return state
 
@@ -1612,15 +1569,9 @@ class AsistenteHistologiaQdrant:
             return ""
 
     async def _nodo_clasificar(self, state: AgentState) -> AgentState:
-        """
-        1. Extrae términos histológicos y entidades para la búsqueda.
-        2. Usa ClasificadorSemantico (ImageBind + LLM) para verificar dominio.
-           Reemplaza la verificación por keywords de v4.0.
-        """
         t0 = time.time()
-        print("🔍 Clasificando consulta (semántico v4.1)...")
+        print("🔍 Clasificando consulta (semántico v5.1)...")
 
-        # ── Extracción de términos ─────────────────────────────────────
         system = (
             "Extrae términos técnicos histológicos de la consulta.\n"
             "Devuelve:\nTEJIDO: [...]\nESTRUCTURA: [...]\nCONCEPTO: [...]\n"
@@ -1643,7 +1594,6 @@ class AsistenteHistologiaQdrant:
         except Exception as e:
             state["terminos_busqueda"] = state["consulta_texto"]
 
-        # ── Entidades para búsqueda por grafo ──────────────────────────
         texto_para_entidades = (
             state["consulta_texto"] + " " + _safe(state.get("analisis_visual"))
         )
@@ -1652,15 +1602,12 @@ class AsistenteHistologiaQdrant:
         )
         print(f"   🏷️ Entidades: {state['entidades_consulta']}")
 
-        # ── Embedding del texto de consulta (Gemini) ───────────────────
         try:
-            emb_texto = self._embed_texto_gemini(state["consulta_texto"])
-            state["texto_embedding"] = emb_texto
+            state["texto_embedding"] = self._embed_texto_gemini(state["consulta_texto"])
         except Exception as e:
             print(f"⚠️ Error embedding texto: {e}")
             state["texto_embedding"] = None
 
-        # ── Clasificación semántica de dominio ─────────────────────────
         verificacion = await self.clasificador_semantico.clasificar(
             consulta       = state["consulta_texto"],
             analisis_visual= state.get("analisis_visual"),
@@ -1678,13 +1625,12 @@ class AsistenteHistologiaQdrant:
               f"Método: {verificacion.get('metodo')}")
 
         state["trayectoria"].append({
-            "nodo":                  "Clasificar",
-            "tema_valido":           state["tema_valido"],
-            "tema_encontrado":       state["tema_encontrado"],
-            "entidades":             state["entidades_consulta"],
-            "similitud_dominio":     state["similitud_semantica_dominio"],
-            "metodo_clasificacion":  verificacion.get("metodo"),
-            "tiempo":                round(time.time()-t0, 2)
+            "nodo": "Clasificar", "tema_valido": state["tema_valido"],
+            "tema_encontrado": state["tema_encontrado"],
+            "entidades": state["entidades_consulta"],
+            "similitud_dominio": state["similitud_semantica_dominio"],
+            "metodo_clasificacion": verificacion.get("metodo"),
+            "tiempo": round(time.time()-t0, 2)
         })
         return state
 
@@ -1749,7 +1695,7 @@ class AsistenteHistologiaQdrant:
 
     async def _nodo_buscar_qdrant(self, state: AgentState) -> AgentState:
         t0 = time.time()
-        print("📚 Búsqueda híbrida Qdrant...")
+        print("📚 Búsqueda híbrida Qdrant v5.1...")
 
         resultados = await self.qdrant_store.busqueda_hibrida(
             texto_embedding        = state.get("texto_embedding"),
@@ -1761,7 +1707,6 @@ class AsistenteHistologiaQdrant:
 
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
-
         state["trayectoria"].append({
             "nodo": "BuscarQdrant", "hits": len(resultados),
             "tiempo": round(time.time()-t0, 2)
@@ -1769,6 +1714,10 @@ class AsistenteHistologiaQdrant:
         return state
 
     async def _nodo_filtrar_contexto(self, state: AgentState) -> AgentState:
+        """
+        v5.1: al construir bloques de contexto para resultados de tipo imagen,
+        incluye texto_pagina (el texto completo del PDF en esa página).
+        """
         t0     = time.time()
         umbral = self.SIMILARITY_THRESHOLD
         validos = [r for r in state["resultados_busqueda"] if r.get("similitud", 0) >= umbral]
@@ -1779,12 +1728,10 @@ class AsistenteHistologiaQdrant:
         vistas: set = set()
         imagenes_unicas: List[str] = []
         for r in validos:
-            # Imágenes directas de resultados tipo imagen
             img_path = r.get("imagen_path")
             if img_path and os.path.exists(img_path) and img_path not in vistas:
                 vistas.add(img_path)
                 imagenes_unicas.append(img_path)
-            # Imágenes cross-referenciadas desde chunks de texto (misma página)
             for img_ref in r.get("imagenes_pagina", []):
                 if img_ref and os.path.exists(img_ref) and img_ref not in vistas:
                     vistas.add(img_ref)
@@ -1795,9 +1742,10 @@ class AsistenteHistologiaQdrant:
             validos_sorted = sorted(validos, key=lambda x: x.get("similitud", 0), reverse=True)
             bloques = []
             for i, r in enumerate(validos_sorted, 1):
-                pag = r.get("pagina")
-                enc = (f"[Sección {i} | Fuente: {r.get('fuente','N/A')} | "
-                       f"Tipo: {r.get('tipo','?')} | Sim: {r.get('similitud',0):.3f}")
+                pag  = r.get("pagina")
+                tipo = r.get("tipo", "?")
+                enc  = (f"[Sección {i} | Fuente: {r.get('fuente','N/A')} | "
+                        f"Tipo: {tipo} | Sim: {r.get('similitud',0):.3f}")
                 if pag:
                     enc += f" | Pág: {pag}"
                 if r.get("imagen_path"):
@@ -1807,11 +1755,28 @@ class AsistenteHistologiaQdrant:
                     nombres = [os.path.basename(p) for p in imgs_pag]
                     enc += f" | Imgs misma pág: {', '.join(nombres)}"
                 enc += "]"
-                # Para resultados tipo imagen, usar texto_pagina si disponible
-                texto_ctx = _safe(r.get("texto", ""))
-                if r.get("tipo") == "imagen" and r.get("texto_pagina"):
-                    texto_ctx = f"{texto_ctx}\n[Texto de la misma página:]\n{r['texto_pagina'][:1200]}"
-                bloques.append(f"{enc}\n{texto_ctx[:1500]}")
+
+                # ── Construir el cuerpo del bloque ────────────────────
+                if tipo == "imagen":
+                    # NUEVO v5.1: para imágenes, incluir AMBOS: ocr_text y
+                    # texto_pagina (el texto del PDF en esa página).
+                    texto_ocr  = _safe(r.get("texto", ""))
+                    texto_pag  = _safe(r.get("texto_pagina", ""))
+                    partes_txt = []
+                    if texto_ocr:
+                        partes_txt.append(f"[OCR imagen]: {texto_ocr[:400]}")
+                    if texto_pag:
+                        partes_txt.append(f"[Texto de la página del PDF]:\n{texto_pag[:1500]}")
+                    texto_ctx = "\n".join(partes_txt) if partes_txt else "(sin texto asociado)"
+                else:
+                    texto_ctx = _safe(r.get("texto", ""))[:1500]
+                    # Para chunks de texto, si hay imágenes en la misma página,
+                    # añadir referencia al texto_pagina si está disponible
+                    if r.get("texto_pagina"):
+                        texto_ctx += f"\n[Contexto adicional de página]: {r['texto_pagina'][:400]}"
+
+                bloques.append(f"{enc}\n{texto_ctx}")
+
             state["contexto_documentos"] = "\n\n".join(bloques)
             print(f"✅ {len(validos)} válidos | {len(imagenes_unicas)} imágenes")
         else:
@@ -1870,14 +1835,24 @@ class AsistenteHistologiaQdrant:
 
         analisis_previo = _safe(state.get("analisis_visual"))
         if analisis_previo:
-            content_parts.append({"type": "text", "text": (
-                f"\nAnálisis previo:\n{analisis_previo[:600]}\n"
-            )})
+            content_parts.append({"type": "text",
+                                   "text": f"\nAnálisis previo:\n{analisis_previo[:600]}\n"})
 
+        # NUEVO v5.1: incluir el texto_pagina de cada imagen de referencia
+        # para que el LLM tenga el contexto textual del manual al compararlas.
         for i, ref_path in enumerate(imagenes_ref, 1):
             content_parts.append({"type": "text", "text": (
                 f"\n=== REFERENCIA #{i} ({os.path.basename(ref_path)}) ==="
             )})
+            # Buscar texto_pagina de esta referencia en resultados válidos
+            texto_pag_ref = ""
+            for r in state.get("resultados_validos", []):
+                if r.get("imagen_path") == ref_path and r.get("texto_pagina"):
+                    texto_pag_ref = r["texto_pagina"]
+                    break
+            if texto_pag_ref:
+                content_parts.append({"type": "text",
+                                       "text": f"[Texto del manual en esta página]:\n{texto_pag_ref[:800]}\n"})
             try:
                 with open(ref_path, "rb") as f:
                     data_r = base64.b64encode(f.read()).decode("utf-8")
@@ -1894,21 +1869,24 @@ class AsistenteHistologiaQdrant:
         content_parts.append({"type": "text", "text": (
             "\n=== INSTRUCCIONES ESTRICTAS ===\n"
             f"Compara rigurosamente basándote en:\n{features_lista}\n\n"
-            "TU ROL ES SER UN JUEZ ESCÉPTICO. Tu objetivo principal es encontrar las DIFERENCIAS que demuestren que NO son el mismo tejido.\n\n"
+            "TU ROL ES SER UN JUEZ ESCÉPTICO. Tu objetivo principal es encontrar las DIFERENCIAS "
+            "que demuestren que NO son el mismo tejido.\n\n"
             "1. TABLA COMPARATIVA (Markdown): | Feature | Consulta | Ref#1 | Ref#2 |\n"
-            "2. VEREDICTO DE IDENTIDAD: Si la imagen de consulta parece ser un órgano distinto al de las referencias, DEBES declarar EXPLÍCITAMENTE que son TEJIDOS DIFERENTES, sin importar su parecido visual por la tinción.\n"
-            "3. CONCLUSIÓN FINAL: ¿Son la misma estructura biológica? (SÍ/NO). Si es NO, indica qué crees que es realmente la imagen de la consulta."
+            "2. VEREDICTO DE IDENTIDAD: Si la imagen de consulta parece ser un órgano distinto "
+            "al de las referencias, DEBES declarar EXPLÍCITAMENTE que son TEJIDOS DIFERENTES.\n"
+            "3. CONCLUSIÓN FINAL: ¿Son la misma estructura biológica? (SÍ/NO). "
+            "Si es NO, indica qué crees que es realmente la imagen de la consulta."
         )})
 
         try:
             resp = await invoke_con_reintento(self.llm, [HumanMessage(content=content_parts)])
-            state["analisis_comparativo"] = resp.content
+            state["analisis_comparativo"]    = resp.content
             state["estructura_identificada"] = await self._extraer_estructura(resp.content)
             print(f"✅ Análisis comparativo: {len(resp.content)} chars")
             print(f"   → Estructura: {state['estructura_identificada']}")
         except Exception as e:
             print(f"❌ Error análisis comparativo: {e}")
-            state["analisis_comparativo"] = None
+            state["analisis_comparativo"]    = None
             state["estructura_identificada"] = None
 
         state["trayectoria"].append({
@@ -1921,9 +1899,7 @@ class AsistenteHistologiaQdrant:
     async def _extraer_estructura(self, analisis: str) -> Optional[str]:
         try:
             resp = await invoke_con_reintento(self.llm, [
-                SystemMessage(content=(
-                    "Extrae el nombre de la estructura histológica más probable. Solo el nombre."
-                )),
+                SystemMessage(content="Extrae el nombre de la estructura histológica más probable. Solo el nombre."),
                 HumanMessage(content=analisis[-1000:])
             ])
             return resp.content.strip()
@@ -1931,15 +1907,23 @@ class AsistenteHistologiaQdrant:
             return None
 
     async def _nodo_generar_respuesta(self, state: AgentState) -> AgentState:
+        """
+        v5.1: el contexto_documentos ya incluye texto_pagina para imágenes
+        (armado en _nodo_filtrar_contexto). Aquí simplemente lo pasamos al LLM.
+        """
         t0 = time.time()
-        print("💭 Generando respuesta v4.1...")
+        print("💭 Generando respuesta v5.1...")
 
         aviso_db = ""
         if not state["contexto_suficiente"]:
-            # Sin contexto RAG pero hay imagen → permitimos que el LLM responda guiándose por la imagen y la memoria
             if state.get("tiene_imagen") and state.get("imagen_path"):
                 print("   ⚠️ Sin contexto RAG pero hay imagen — permitiendo chat con imagen")
-                aviso_db = "\n\nAVISO PARA EL ASISTENTE: No se encontraron resultados en la base de datos para esta consulta. DEBES informar explícitamente al usuario que no encontraste información referenciada en el manual, pero responde a su pregunta basándote en la imagen subida y el historial de chat."
+                aviso_db = (
+                    "\n\nAVISO PARA EL ASISTENTE: No se encontraron resultados en la base de datos "
+                    "para esta consulta. DEBES informar explícitamente al usuario que no encontraste "
+                    "información referenciada en el manual, pero responde a su pregunta basándote "
+                    "en la imagen subida y el historial de chat."
+                )
                 state["contexto_suficiente"] = True
             else:
                 state["respuesta_final"] = (
@@ -1966,7 +1950,7 @@ class AsistenteHistologiaQdrant:
             "3. No diagnósticos clínicos salvo que estén explícitos.\n\n"
             "ESTRUCTURA:\n"
             "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
-            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si concluye que la imagen del usuario NO ES LA MISMA ESTRUCTURA que las imágenes de referencia del manual, debes informar al usuario: 'Tu imagen parece ser X, pero el manual solo contiene información sobre Y, por lo que no puedo ayudarte con el manual.' y DETENTE AHÍ.\n"
+            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si concluye que la imagen del usuario NO ES LA MISMA ESTRUCTURA que las imágenes de referencia del manual, informa al usuario y DETENTE AHÍ.\n"
             "3. Características histológicas según la base de datos (SOLO si las estructuras coinciden)\n"
             "4. Conclusión y confianza"
             f"{nota_comp}{aviso_db}"
@@ -1992,7 +1976,8 @@ class AsistenteHistologiaQdrant:
             f"**ENTIDADES (grafo):** {entidades_str}\n\n"
             f"**TEMA:** {tema_str}\n\n"
             f"**ANÁLISIS VISUAL USUARIO:**\n{analisis_visual_str[:800]}\n\n"
-            f"**SECCIONES DEL MANUAL:**\n{state['contexto_documentos']}"
+            f"**SECCIONES DEL MANUAL (incluyen texto de páginas con imágenes):**\n"
+            f"{state['contexto_documentos']}"
             f"{seccion_comp}{seccion_est}\n\n"
             "Responde EXCLUSIVAMENTE con el contenido del manual e imágenes de referencia."
         )}]
@@ -2040,10 +2025,10 @@ class AsistenteHistologiaQdrant:
             ])
             if state.get("confianza_baja"):
                 warning = "⚠️ *Nota: Esta respuesta se generó con confianza baja (<71% de coincidencia) en los apuntes, tómalo en cuenta.*"
-                if "Hola, ¿en qué te puedo ayudar sobre histología?" in resp.content:
-                    state["respuesta_final"] = resp.content
-                else:
-                    state["respuesta_final"] = f"{warning}\n\n{resp.content}"
+                state["respuesta_final"] = (
+                    resp.content if "Hola, ¿en qué te puedo ayudar sobre histología?" in resp.content
+                    else f"{warning}\n\n{resp.content}"
+                )
             else:
                 state["respuesta_final"] = resp.content
             print(f"✅ Respuesta: {len(resp.content)} chars")
@@ -2059,7 +2044,6 @@ class AsistenteHistologiaQdrant:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
-        # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
             self.memoria.add_interaction(state["consulta_texto"], state["respuesta_final"])
 
@@ -2074,7 +2058,7 @@ class AsistenteHistologiaQdrant:
                 "entidades_consulta":      state.get("entidades_consulta", {}),
             }, f, indent=4, ensure_ascii=False)
 
-        print(f"✅ Flujo v5.0 completado en {total}s")
+        print(f"✅ Flujo v5.1 completado en {total}s")
         if state.get("estructura_identificada"):
             print(f"   → Estructura: {state['estructura_identificada']}")
         return state
@@ -2084,17 +2068,16 @@ class AsistenteHistologiaQdrant:
     # ------------------------------------------------------------------
 
     def _embed_texto_gemini(self, texto: str) -> List[float]:
-        # Usa langchain GoogleGenerativeAIEmbeddings
         return embed_query_con_reintento(self.embeddings, texto)
 
-
     # ------------------------------------------------------------------
-    # Indexación en Qdrant
+    # Indexación en Qdrant — v5.1
+    # NUEVO: upsert_imagen recibe emb_texto (Gemini sobre ocr+texto_pagina)
     # ------------------------------------------------------------------
 
     def _leer_pdf(self, path: str) -> str:
         try:
-            doc = fitz.open(path)
+            doc   = fitz.open(path)
             texto = "".join(page.get_text() for page in doc)
             doc.close()
             return texto
@@ -2103,9 +2086,8 @@ class AsistenteHistologiaQdrant:
             return ""
 
     def _leer_pdf_por_pagina(self, path: str) -> List[Tuple[int, str]]:
-        """Devuelve [(pagina, texto), ...] para cada página del PDF."""
         try:
-            doc = fitz.open(path)
+            doc     = fitz.open(path)
             paginas = [(i + 1, page.get_text()) for i, page in enumerate(doc)]
             doc.close()
             return paginas
@@ -2130,7 +2112,6 @@ class AsistenteHistologiaQdrant:
             print("⚠️ Contenido base vacío")
             return
         await self.extractor_temario.extraer_temario(self.contenido_base)
-        # Actualizar clasificador semántico con el temario real
         if self.clasificador_semantico:
             self.clasificador_semantico.temario = self.extractor_temario.temas
             print(f"   🔄 Clasificador semántico actualizado con "
@@ -2139,45 +2120,43 @@ class AsistenteHistologiaQdrant:
     async def indexar_en_qdrant(self, directorio_pdfs: str = DIRECTORIO_PDFS,
                                  imagen_files_extra: Optional[List[str]] = None,
                                  forzar: bool = False):
-        # ── Verificar si ya hay datos ────────────────────────────────
+        # ── Verificar si ya hay datos ──────────────────────────────────
         if not forzar:
             try:
                 n_chunks = await self.qdrant_store.contar_chunks()
                 n_imgs   = await self.qdrant_store.contar_imagenes()
                 if n_chunks > 0 and n_imgs > 0:
-                    print(f"✅ Base de datos Qdrant ya poblada ({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
+                    print(f"✅ Base de datos Qdrant ya poblada "
+                          f"({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
                     print("   (Usá --reindex --force para forzar re-indexación)")
                     return
             except Exception as e:
                 print(f"⚠️ No se pudo verificar estado de la BD: {e}")
 
-        # ── PASO 1: Extraer imágenes PRIMERO para construir mapa página→imágenes ──
+        # ── PASO 1: Extraer imágenes PRIMERO ──────────────────────────
         print("📸 Extrayendo imágenes de PDFs...")
         imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
 
-        # Construir mapa: (fuente, pagina) → [paths de imágenes]
         from collections import defaultdict
         mapa_imagenes_pagina: Dict[tuple, List[str]] = defaultdict(list)
         for img_info in imagenes_pdf:
             key = (img_info["fuente_pdf"], img_info["pagina"])
-            mapa_imagenes_pagina[key].append(img_info["path"])
+            if os.path.exists(img_info["path"]):   # solo rutas válidas
+                mapa_imagenes_pagina[key].append(img_info["path"])
         print(f"   📋 Mapa construido: {len(mapa_imagenes_pagina)} páginas con imágenes")
 
-        # Construir mapa: (fuente, pagina) → texto_pagina (para enriquecer imágenes)
         mapa_texto_pagina: Dict[tuple, str] = {}
 
-        # ── PASO 2: Indexar chunks de texto con referencias a imágenes ──
+        # ── PASO 2: Indexar chunks de texto ───────────────────────────
         print("📄 Indexando chunks de texto en Qdrant (por página)...")
         for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
-            fuente = os.path.basename(pdf_path)
+            fuente  = os.path.basename(pdf_path)
             paginas = self._leer_pdf_por_pagina(pdf_path)
             chunk_global = 0
             for pagina_num, texto_pagina in paginas:
-                # Guardar texto de página para enriquecer imágenes después
                 mapa_texto_pagina[(fuente, pagina_num)] = texto_pagina
-                # Obtener imágenes de esta misma página
                 imgs_esta_pagina = mapa_imagenes_pagina.get((fuente, pagina_num), [])
-                chunks_pagina = self._chunks(texto_pagina)
+                chunks_pagina    = self._chunks(texto_pagina)
                 for i, chunk in enumerate(chunks_pagina):
                     try:
                         emb       = self._embed_texto_gemini(chunk)
@@ -2194,26 +2173,41 @@ class AsistenteHistologiaQdrant:
                         print(f"  ⚠️ Chunk p{pagina_num}/{i}: {e}")
             print(f"  {fuente}: {chunk_global} chunks ({len(paginas)} páginas)")
 
-        # ── PASO 3: Indexar imágenes con texto de su página ──
-        print("📸 Indexando imágenes en Qdrant (con texto de página)...")
+        # ── PASO 3: Indexar imágenes con embedding textual ────────────
+        # NUEVO v5.1: calcular emb_texto = Gemini(ocr_text + texto_pagina)
+        print("📸 Indexando imágenes en Qdrant (con texto_emb Gemini)...")
         for img_info in imagenes_pdf:
             img_path = img_info["path"]
             if not os.path.exists(img_path):
                 continue
             try:
-                emb_u  = self.uni.embed_image(img_path)
-                emb_p  = self.plip.embed_image(img_path)
-                img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
-                # Obtener texto de la misma página
+                emb_u = self.uni.embed_image(img_path)
+                emb_p = self.plip.embed_image(img_path)
+
+                img_id    = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
                 texto_pag = mapa_texto_pagina.get(
                     (img_info["fuente_pdf"], img_info["pagina"]), ""
                 )
+
+                # Construir texto combinado para el embedding textual de la imagen
+                ocr_text      = img_info.get("ocr_text", "")
+                texto_combined = f"{ocr_text} {texto_pag}".strip()
+
+                # Calcular embedding Gemini del texto combinado
+                emb_t: Optional[List[float]] = None
+                if texto_combined:
+                    try:
+                        emb_t = self._embed_texto_gemini(texto_combined[:2000])
+                    except Exception as e:
+                        print(f"  ⚠️ emb_texto para {img_id}: {e}")
+
                 await self.qdrant_store.upsert_imagen(
                     imagen_id=img_id, path=img_path,
                     fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
-                    ocr_text=img_info.get("ocr_text", ""),
+                    ocr_text=ocr_text,
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist(),
+                    emb_texto=emb_t,           # NUEVO v5.1
                     texto_pagina=texto_pag
                 )
             except Exception as e:
@@ -2223,23 +2217,30 @@ class AsistenteHistologiaQdrant:
             if not os.path.exists(img_path):
                 continue
             try:
-
                 ocr = ""
                 try:
                     ocr = pytesseract.image_to_string(Image.open(img_path)).strip()
                 except Exception:
                     pass
                 img_id = f"img_extra_{os.path.basename(img_path)}"
-                emb_u = self.uni.embed_image(img_path)
-                emb_p = self.plip.embed_image(img_path)
+                emb_u  = self.uni.embed_image(img_path)
+                emb_p  = self.plip.embed_image(img_path)
+                emb_t: Optional[List[float]] = None
+                if ocr:
+                    try:
+                        emb_t = self._embed_texto_gemini(ocr[:2000])
+                    except Exception:
+                        pass
                 await self.qdrant_store.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
-                    pagina=0, ocr_text=ocr[:300], emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
+                    pagina=0, ocr_text=ocr[:300],
+                    emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist(),
+                    emb_texto=emb_t, texto_pagina=""
                 )
             except Exception as e:
                 print(f"  ❌ Imagen extra {img_path}: {e}")
 
-        print("✅ Indexación Qdrant completada")
+        print("✅ Indexación Qdrant v5.1 completada")
 
     # ------------------------------------------------------------------
     # Punto de entrada público
@@ -2248,15 +2249,11 @@ class AsistenteHistologiaQdrant:
     async def consultar(self, consulta_texto: str,
                          imagen_path: Optional[str] = None,
                          user_id: str = "default_user") -> str:
-        """
-        La imagen es completamente opcional en cada llamada.
-        Si no se pasa, se reutiliza la última imagen activa en memoria.
-        """
         imagen_activa       = imagen_path or self.memoria.get_imagen_activa()
         tiene_imagen_activa = self.memoria.tiene_imagen_previa() or bool(imagen_path)
 
         print(f"\n{'='*70}")
-        print(f"🔬 RAG Histología Qdrant v5.0 | umbral={self.SIMILARITY_THRESHOLD}")
+        print(f"🔬 RAG Histología Qdrant v5.1 | umbral={self.SIMILARITY_THRESHOLD}")
         print(f"   Texto:         {consulta_texto}")
         print(f"   Imagen turno:  {imagen_path or 'ninguna'}")
         print(f"   Imagen activa: {imagen_activa or 'ninguna'}")
@@ -2265,8 +2262,8 @@ class AsistenteHistologiaQdrant:
         initial_state = AgentState(
             messages=[], consulta_texto=consulta_texto,
             imagen_path=imagen_activa,
-            imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None, contexto_memoria="",
-            contenido_base=self.contenido_base, terminos_busqueda="",
+            imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None,
+            contexto_memoria="", contenido_base=self.contenido_base, terminos_busqueda="",
             entidades_consulta={"tejidos": [], "estructuras": [], "tinciones": []},
             consulta_busqueda_texto="", consulta_busqueda_visual="",
             resultados_busqueda=[], resultados_validos=[], contexto_documentos="",
@@ -2280,13 +2277,13 @@ class AsistenteHistologiaQdrant:
 
         config = {
             "configurable": {"thread_id": user_id},
-            "run_name":     f"consulta-qdrant-v5.0-{user_id}",
-            "tags":         ["rag", "histologia", "qdrant", "v5.0"],
+            "run_name":     f"consulta-qdrant-v5.1-{user_id}",
+            "tags":         ["rag", "histologia", "qdrant", "v5.1"],
             "metadata": {
                 "tiene_imagen_nueva":  imagen_path is not None,
                 "tiene_imagen_activa": tiene_imagen_activa,
                 "consulta":            consulta_texto[:100],
-                "version":             "4.1"
+                "version":             "5.1"
             }
         }
         try:
@@ -2307,7 +2304,7 @@ class AsistenteHistologiaQdrant:
 
 
 # =============================================================================
-# MODO INTERACTIVO MEJORADO v4.1
+# MODO INTERACTIVO
 # =============================================================================
 
 async def modo_interactivo(reindex: bool = False, force: bool = False):
@@ -2329,7 +2326,7 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║   RAG Histología Qdrant v5.0 — Chat Interactivo             ║
+║   RAG Histología Qdrant v5.1 — Chat Interactivo             ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  • Escribí tu pregunta y presioná Enter                     ║
 ║  • Para subir una imagen: escribí el PATH cuando se pida    ║
@@ -2345,7 +2342,6 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
     while True:
         try:
             print("\n" + "─"*60)
-
             img_activa = asistente.memoria.get_imagen_activa()
             if img_activa:
                 print(f"📌 Imagen activa: {os.path.basename(img_activa)} "
@@ -2381,7 +2377,6 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
                 print("🗑️  Imagen activa eliminada. El próximo turno será solo texto.")
                 continue
 
-            # Imagen opcional
             imagen_path = None
             img_input   = input("🖼️  Imagen (path o Enter para omitir): ").strip()
 
@@ -2411,8 +2406,10 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reindex", action="store_true", help="Indexar en Qdrant (salta si ya hay datos)")
-    parser.add_argument("--force", action="store_true", help="Forzar re-indexación aunque haya datos")
+    parser.add_argument("--reindex", action="store_true",
+                        help="Indexar en Qdrant (salta si ya hay datos)")
+    parser.add_argument("--force", action="store_true",
+                        help="Forzar re-indexación aunque haya datos")
     args = parser.parse_args()
 
     import logging

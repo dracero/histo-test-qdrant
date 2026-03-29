@@ -1,0 +1,4 @@
+# file: /media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/.venv/bin/pytest
+# hypothesis_version: 6.151.9
+
+['-script.pyw', '.exe', '__main__']

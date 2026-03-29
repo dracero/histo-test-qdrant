@@ -8,7 +8,7 @@
             "nodo": "ProcesarImagen",
             "tiene_imagen": true,
             "imagen_es_nueva": true,
-            "tiempo": 2.08
+            "tiempo": 12.86
         },
         {
             "nodo": "Clasificar",
@@ -16,77 +16,67 @@
             "tema_encontrado": null,
             "entidades": {
                 "tejidos": [
-                    "cartilaginoso"
+                    "epitelial"
                 ],
-                "estructuras": [
-                    "células",
-                    "matriz territorial",
-                    "grupos isógenos"
-                ],
+                "estructuras": [],
                 "tinciones": [
                     "hematoxilina y eosina (h&e)"
                 ]
             },
-            "similitud_dominio": 0.8374750892024189,
+            "similitud_dominio": 0.693669086408519,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 2.52
+            "tiempo": 8.44
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Describe el tejido histológico de la imagen.",
-            "tiempo": 0.51
+            "query": "Cartílago hialino en disco de crecimiento",
+            "tiempo": 2.37
         },
         {
             "nodo": "BuscarQdrant",
             "hits": 15,
-            "tiempo": 5.1
+            "tiempo": 12.75
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 11,
-            "imgs": 10,
+            "hits_validos": 14,
+            "imgs": 8,
             "tiempo": 0.0
         },
         {
             "nodo": "AnalisisComparativo",
             "refs": 3,
-            "estructura": "Cartílago hialino.",
-            "tiempo": 2.89
+            "estructura": "Epitelio.",
+            "tiempo": 24.94
         },
         {
             "nodo": "GenerarRespuesta",
             "contexto_suficiente": true,
             "imagenes_usadas": 3,
             "tiene_comparativo": true,
-            "tiempo": 2.57
+            "tiempo": 27.77
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 15.7
+            "tiempo_total": 91.64
         }
     ],
-    "estructura_identificada": "Cartílago hialino.",
+    "estructura_identificada": "Epitelio.",
     "imagenes_recuperadas": [
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p2_img2.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p20_img22.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p10_img10.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p14_img14.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p17_img19.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p19_img21.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p13_img13.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p31_img34.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p26_img29.jpg",
-        "/home/cetec/AIProjects/histo-test/imagenes_extraidas/arch2_p22_img25.jpg"
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p4_img4.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p1_img1.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p10_img10.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p34_img37.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p2_img2.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p6_img6.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p5_img5.jpg",
+        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p3_img3.jpg"
     ],
     "entidades_consulta": {
         "tejidos": [
-            "cartilaginoso"
+            "epitelial"
         ],
-        "estructuras": [
-            "células",
-            "matriz territorial",
-            "grupos isógenos"
-        ],
+        "estructuras": [],
         "tinciones": [
             "hematoxilina y eosina (h&e)"
         ]
