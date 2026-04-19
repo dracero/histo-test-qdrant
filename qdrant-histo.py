@@ -905,7 +905,7 @@ class QdrantVectorStore:
             agregar(res_ent, 0.50)
             
             # Fallback contextual: los textos de la página de la imagen (solo útiles si no hay un buen match en res_texto)
-            agregar(res_pag_chunks, 0.40)
+            agregar(res_pag_chunks, 0.15)
         else:
             agregar(res_texto, 0.80)
             agregar(res_uni, 0.20, es_visual=True)
@@ -2963,6 +2963,7 @@ class AsistenteHistologiaQdrant:
 
     def _leer_pdf(self, path: str) -> str:
         try:
+            import fitz
             doc = fitz.open(path)
             texto = "".join(page.get_text() for page in doc)
             doc.close()
@@ -2970,6 +2971,18 @@ class AsistenteHistologiaQdrant:
         except Exception as e:
             print(f"⚠️ Error leyendo {path}: {e}")
             return ""
+
+    def _leer_pdf_por_paginas(self, path: str) -> Dict[int, str]:
+        paginas = {}
+        try:
+            import fitz
+            doc = fitz.open(path)
+            for i, page in enumerate(doc):
+                paginas[i + 1] = page.get_text()
+            doc.close()
+        except Exception as e:
+            print(f"⚠️ Error leyendo por páginas {path}: {e}")
+        return paginas
 
     def _chunks(self, texto: str, size: int = 500) -> List[str]:
         return [texto[i:i+size] for i in range(0, len(texto), size)]
@@ -3009,24 +3022,38 @@ class AsistenteHistologiaQdrant:
             except Exception as e:
                 print(f"⚠️ No se pudo verificar estado de la BD: {e}")
 
-        print("📄 Indexando chunks de texto en Neo4j...")
+        print("📄 Preparando extracción de imágenes para vincular a chunks...")
+        imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
+        
+        img_por_pdf_pag = {}
+        for img_info in imagenes_pdf:
+            k = (img_info["fuente_pdf"], img_info["pagina"])
+            if k not in img_por_pdf_pag:
+                img_por_pdf_pag[k] = []
+            img_por_pdf_pag[k].append(img_info["path"])
+
+        print("📄 Indexando chunks de texto en Qdrant (por página)...")
         for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
             fuente = os.path.basename(pdf_path)
-            await self.neo4j.upsert_pdf(fuente)
-            texto  = self._leer_pdf(pdf_path)
-            chunks = self._chunks(texto)
-            print(f"  {fuente}: {len(chunks)} chunks")
-            for i, chunk in enumerate(chunks):
-                try:
-                    emb       = self._embed_texto(chunk)
-                    chunk_id  = f"chunk_{fuente}_{i}"
-                    entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
-                    await self.neo4j.upsert_chunk(
-                        chunk_id=chunk_id, texto=chunk, fuente=fuente,
-                        chunk_idx=i, embedding=emb, entidades=entidades
-                    )
-                except Exception as e:
-                    print(f"  ⚠️ Chunk {i}: {e}")
+            # await self.neo4j.upsert_pdf(fuente) # No longer needed in Qdrant
+            paginas_texto = self._leer_pdf_por_paginas(pdf_path)
+            for num_pagina, texto_pag in paginas_texto.items():
+                chunks = self._chunks(texto_pag)
+                img_paths = img_por_pdf_pag.get((fuente, num_pagina), [])
+                
+                for i, chunk in enumerate(chunks):
+                    if not chunk.strip(): continue
+                    try:
+                        emb       = self._embed_texto(chunk)
+                        chunk_id  = f"chunk_{fuente}_p{num_pagina}_{i}"
+                        entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
+                        await self.neo4j.upsert_chunk(
+                            chunk_id=chunk_id, texto=chunk, fuente=fuente,
+                            chunk_idx=i, embedding=emb, entidades=entidades,
+                            pagina=num_pagina, imagenes_pagina=img_paths
+                        )
+                    except Exception as e:
+                        print(f"  ⚠️ Chunk {fuente} p{num_pagina}-{i}: {e}")
 
         print("📸 Indexando imágenes de PDFs en Neo4j...")
         imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
@@ -3048,6 +3075,14 @@ class AsistenteHistologiaQdrant:
                 # Log de la imagen para trazabilidad
                 print(f"  📷 {nombre_archivo} | Etiqueta: {etiqueta or 'N/A'} | Caption: {len(caption)} chars")
                 
+                emb_texto = None
+                texto_relevante = caption if caption else (img_info.get("texto_pagina", "")[:500])
+                if texto_relevante:
+                    try:
+                        emb_texto = self._embed_texto(texto_relevante)
+                    except Exception:
+                        pass
+                
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path,
                     fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
@@ -3055,6 +3090,7 @@ class AsistenteHistologiaQdrant:
                     texto_pagina=img_info.get("texto_pagina", ""),
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist(),
+                    emb_texto=emb_texto,
                     caption=caption,
                     nombre_archivo=nombre_archivo,
                     etiqueta=etiqueta
@@ -3076,9 +3112,16 @@ class AsistenteHistologiaQdrant:
                 # Extra images are not preprocessed, apply preprocessing
                 emb_u = self.uni.embed_image(img_path, preprocess=True)
                 emb_p = self.plip.embed_image(img_path, preprocess=True)
+                emb_texto = None
+                if ocr:
+                    try:
+                        emb_texto = self._embed_texto(ocr[:500])
+                    except Exception:
+                        pass
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
-                    pagina=0, ocr_text=ocr[:300], texto_pagina="", emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
+                    pagina=0, ocr_text=ocr[:300], texto_pagina="", emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist(),
+                    emb_texto=emb_texto
                 )
             except Exception as e:
                 print(f"  ❌ Imagen extra {img_path}: {e}")

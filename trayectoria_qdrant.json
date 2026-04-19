@@ -6,90 +6,71 @@
         },
         {
             "nodo": "Router:_route_por_modo",
-            "modo_detectado": "solo_texto",
-            "tiene_imagen_nueva": null,
+            "modo_detectado": "con_imagen",
+            "tiene_imagen_nueva": true,
             "tiene_imagen_memoria": true,
-            "hace_referencia_imagen": false
+            "hace_referencia_imagen": true
+        },
+        {
+            "nodo": "ProcesarImagen",
+            "tiene_imagen": true,
+            "imagen_es_nueva": true,
+            "tiempo": 3.81
         },
         {
             "nodo": "Clasificar",
             "tema_valido": true,
             "tema_encontrado": null,
             "entidades": {
-                "tejidos": [
-                    "sistema nervioso"
-                ],
-                "estructuras": [
-                    "neuroglia",
-                    "astrocitos"
-                ],
+                "tejidos": [],
+                "estructuras": [],
                 "tinciones": []
             },
-            "similitud_dominio": 0.45930825838315725,
+            "similitud_dominio": 0.5850832210177868,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 1.82
+            "tiempo": 1.33
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Descripción de neuroglia y sus tipos celulares.",
-            "tiempo": 0.54
+            "query": "Describir tejido nervioso en imagen.",
+            "tiempo": 0.41
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 10,
-            "imagenes_para_mostrar": 2,
-            "tiempo": 1.7
+            "imagenes_para_mostrar": 0,
+            "tiempo": 1.61
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 10,
+            "hits_validos": 0,
             "imgs": 0,
-            "modo": "solo_texto",
+            "modo": "multimodal",
+            "tiempo": 0.0
+        },
+        {
+            "nodo": "AnalisisComparativo",
+            "motivo": "sin referencias",
             "tiempo": 0.0
         },
         {
             "nodo": "GenerarRespuesta",
-            "contexto_suficiente": true,
-            "imagenes_usadas": 0,
-            "tiene_comparativo": false,
-            "tiempo": 2.06
+            "contexto_suficiente": false,
+            "modo": "multimodal",
+            "tiempo": 0.0
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 10.08
+            "tiempo_total": 7.18
         }
     ],
     "estructura_identificada": null,
     "imagenes_recuperadas": [],
     "entidades_consulta": {
-        "tejidos": [
-            "sistema nervioso"
-        ],
-        "estructuras": [
-            "neuroglia",
-            "astrocitos"
-        ],
+        "tejidos": [],
+        "estructuras": [],
         "tinciones": []
     },
-    "mostrar_imagenes": true,
-    "imagenes_para_mostrar": [
-        {
-            "id": "39a3ee3d-c028-5e1d-87a3-380b2bb782e8",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag1.png",
-            "caption": "SGC- MC-ML05\nV. 02\n1/223\nImagen 11.1. Tejido Conectivo Especializado, Cartílago Hialino.\nLaminilla No: \nTráquea 44\nE. S.\nTejido: \nConectivo \nEspecializado\nVariedad: \nCartilaginoso: \nHialino\nEstructura señalada: \nPericondrio: capa fibrosa (fibroblastos,\nfibras de colágena dispuestas \nregularmente) y capa \ncondrógena\n(condroblastos y células condrógenas)",
-            "nombre_archivo": "arch2_pag1.png",
-            "etiqueta": "Imagen 11.1",
-            "fuente": "arch2.pdf",
-            "similitud_semantica": 0.390658155856689
-        },
-        {
-            "id": "68e4e345-c82d-5f62-b13f-e9372888e3e8",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag5.png",
-            "caption": "Imagen 11.5. Tejido Conectivo Especializado, Cartílago Fibroso.\nLaminilla No:\nHueso fractu-\nrado 79. c.\nTejido: \nConectivo \nEspecializado\nVariedad: \nCartílago \nFibroso\nEstructura señalada: \nHileras de condrocitos, fibras de \ncolágena dispuestas \nregularmente",
-            "nombre_archivo": "arch2_pag5.png",
-            "etiqueta": "Imagen 11.5",
-            "fuente": "arch2.pdf",
-            "similitud_semantica": 0.3145531289536825
-        }
-    ]
+    "mostrar_imagenes": false,
+    "imagenes_para_mostrar": []
 }

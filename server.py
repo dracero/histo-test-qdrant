@@ -273,8 +273,8 @@ async def limpiar_imagen():
 
 
 # ── Ruta estática: imágenes extraídas ────────────────────────────────
-if IMAGENES_DIR.exists():
-    app.mount("/imagenes_extraidas", StaticFiles(directory=str(IMAGENES_DIR)), name="imagenes_extraidas")
+IMAGENES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/imagenes_extraidas", StaticFiles(directory=str(IMAGENES_DIR)), name="imagenes_extraidas")
 
 
 # ── Main ─────────────────────────────────────────────────────────────
