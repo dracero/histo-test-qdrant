@@ -716,6 +716,192 @@ body {
 .a2ui-text-body { font-size: 0.9rem; color: var(--text-secondary); line-height: 1.6; }
 .a2ui-divider { height: 1px; background: var(--border-glass); margin: 0.25rem 0; }
 
+/* ── Retrieved images in responses ──────────────────────────────────── */
+.retrieved-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border-glass);
+}
+
+.retrieved-image-figure {
+    flex: 0 0 auto;
+    max-width: 280px;
+    text-align: center;
+    cursor: pointer;
+    transition: transform var(--transition);
+}
+
+.retrieved-image-figure:hover {
+    transform: scale(1.02);
+}
+
+.retrieved-image {
+    max-width: 100%;
+    max-height: 220px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-glass);
+    box-shadow: var(--shadow-sm);
+    transition: border-color var(--transition);
+}
+
+.retrieved-image:hover {
+    border-color: var(--primary);
+}
+
+.retrieved-image-figure figcaption {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-top: 0.35rem;
+    word-break: break-word;
+}
+
+/* ── Image Gallery (DB images shown on request) ────────────────────── */
+.image-gallery {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border-glass);
+}
+
+.gallery-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 0.75rem;
+    letter-spacing: 0.3px;
+}
+
+.gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 0.75rem;
+}
+
+.gallery-item {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border-glass);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: all var(--transition);
+    cursor: pointer;
+}
+
+.gallery-item:hover {
+    border-color: var(--primary);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md), 0 0 12px rgba(124, 58, 237, 0.15);
+}
+
+.gallery-img {
+    width: 100%;
+    height: 180px;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.3s ease;
+}
+
+.gallery-item:hover .gallery-img {
+    transform: scale(1.03);
+}
+
+.gallery-label {
+    padding: 0.5rem 0.6rem 0.15rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--primary-light);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.gallery-caption {
+    padding: 0.15rem 0.6rem 0.5rem;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* ── Lightbox (fullscreen image viewer) ────────────────────────────── */
+.lightbox-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(12px);
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.2s ease;
+    padding: 2rem;
+}
+
+.lightbox-container {
+    max-width: 90vw;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+    position: relative;
+}
+
+.lightbox-close {
+    position: absolute;
+    top: -1.5rem;
+    right: -1rem;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: var(--text-primary);
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition);
+    z-index: 1001;
+}
+
+.lightbox-close:hover {
+    background: rgba(239, 68, 68, 0.3);
+    border-color: var(--error);
+    color: white;
+}
+
+.lightbox-img {
+    max-width: 85vw;
+    max-height: 75vh;
+    object-fit: contain;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    border: 1px solid var(--border-glass);
+}
+
+.lightbox-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--primary-light);
+    text-align: center;
+}
+
+.lightbox-caption {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    text-align: center;
+    max-width: 700px;
+    line-height: 1.5;
+    max-height: 120px;
+    overflow-y: auto;
+}
+
 /* ── Animations ────────────────────────────────────────────────────── */
 @keyframes fadeIn {
     from { opacity: 0; }

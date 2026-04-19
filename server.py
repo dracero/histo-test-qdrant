@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
-# ── Importar el módulo principal ─────────────────────────────────────────
+# ── Importar el módulo principal ─────────────────────────────────────
 # qdrant-histo.py tiene guión, así que lo importamos con importlib
 import importlib.util
 
@@ -43,7 +43,7 @@ sys.argv = _original_argv
 AsistenteHistologiaQdrant = qdrant_histo.AsistenteHistologiaQdrant
 DIRECTORIO_PDFS = qdrant_histo.DIRECTORIO_PDFS
 
-# ── Estado global ────────────────────────────────────────────────
+# ── Estado global ────────────────────────────────────────────────────
 asistente: Optional[AsistenteHistologiaQdrant] = None
 _init_complete = False
 _init_error: Optional[str] = None
@@ -60,8 +60,10 @@ class ChatResponse(BaseModel):
     respuesta: str
     estructura_identificada: Optional[str] = None
     imagenes_recuperadas: list = []
+    imagenes_base64: list = []  # Lista de {filename, base64, mime_type}
     trayectoria: list = []
     imagen_activa: Optional[str] = None
+    mostrar_imagenes: bool = False
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
@@ -105,7 +107,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RAG Histología Qdrant + A2UI",
     description="Sistema RAG Multimodal de Histología — Fullstack",
-    version="5.0.0",
+    version="4.1.0",
     lifespan=lifespan,
 )
 
@@ -119,6 +121,9 @@ app.add_middleware(
 
 # Archivos estáticos del cliente
 CLIENT_DIR = Path(__file__).parent / "client"
+
+# Directorio de imágenes extraídas (para servir al frontend)
+IMAGENES_DIR = Path(__file__).parent / "imagenes_extraidas"
 
 
 def _check_ready():
@@ -202,18 +207,36 @@ async def post_chat(req: ChatRequest):
             imagen_path=imagen_path,
         )
 
-        # Leer trayectoria
+        # Leer resultado directo del asistente (más confiable que el archivo JSON)
+        resultado_directo = getattr(asistente, '_ultimo_resultado', {})
+        estructura = resultado_directo.get("estructura_identificada")
+
+        # Imágenes de la BD para mostrar al usuario
+        imagenes_para_mostrar = resultado_directo.get("imagenes_para_mostrar", [])
+        imagenes_response = []
+        mostrar_imgs = resultado_directo.get("mostrar_imagenes", False)
+        
+        if mostrar_imgs and imagenes_para_mostrar:
+            for img_info in imagenes_para_mostrar:
+                nombre = img_info.get("nombre_archivo", "")
+                if nombre:
+                    imagenes_response.append({
+                        "url": f"/imagenes_extraidas/{nombre}",
+                        "caption": img_info.get("caption", ""),
+                        "etiqueta": img_info.get("etiqueta", ""),
+                        "nombre_archivo": nombre,
+                        "similitud": img_info.get("similitud_semantica", 0),
+                    })
+            print(f"🖼️ {len(imagenes_response)} imágenes para mostrar al usuario")
+
+        # Leer trayectoria del archivo (solo para metadata de debug)
         trayectoria = []
-        estructura = None
-        imagenes_rec = []
         trayectoria_file = Path(__file__).parent / "trayectoria_qdrant.json"
         if trayectoria_file.exists():
             try:
                 with open(trayectoria_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 trayectoria = data.get("trayectoria", [])
-                estructura = data.get("estructura_identificada")
-                imagenes_rec = data.get("imagenes_recuperadas", [])
             except Exception:
                 pass
 
@@ -224,9 +247,11 @@ async def post_chat(req: ChatRequest):
         return ChatResponse(
             respuesta=respuesta,
             estructura_identificada=estructura,
-            imagenes_recuperadas=[os.path.basename(p) for p in imagenes_rec],
+            imagenes_recuperadas=imagenes_response,
+            imagenes_base64=[],
             trayectoria=trayectoria,
             imagen_activa=img_activa,
+            mostrar_imagenes=mostrar_imgs and len(imagenes_response) > 0,
         )
 
     except Exception as e:
@@ -245,6 +270,11 @@ async def limpiar_imagen():
     if asistente.memoria:
         asistente.memoria.set_imagen(None)
     return {"ok": True, "mensaje": "Imagen activa eliminada"}
+
+
+# ── Ruta estática: imágenes extraídas ────────────────────────────────
+if IMAGENES_DIR.exists():
+    app.mount("/imagenes_extraidas", StaticFiles(directory=str(IMAGENES_DIR)), name="imagenes_extraidas")
 
 
 # ── Main ─────────────────────────────────────────────────────────────

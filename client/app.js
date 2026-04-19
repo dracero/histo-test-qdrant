@@ -185,6 +185,52 @@ function addMessage(role, text, imageBase64 = null, metadata = null) {
         bubble.appendChild(p);
     }
 
+    // Image gallery from database (retrieved images)
+    if (metadata && metadata.imagenes_recuperadas && metadata.imagenes_recuperadas.length > 0) {
+        const gallery = document.createElement('div');
+        gallery.className = 'image-gallery';
+
+        const galleryTitle = document.createElement('div');
+        galleryTitle.className = 'gallery-title';
+        galleryTitle.textContent = `📸 Imágenes del manual (${metadata.imagenes_recuperadas.length})`;
+        gallery.appendChild(galleryTitle);
+
+        const galleryGrid = document.createElement('div');
+        galleryGrid.className = 'gallery-grid';
+
+        metadata.imagenes_recuperadas.forEach((img, idx) => {
+            const item = document.createElement('div');
+            item.className = 'gallery-item';
+
+            const imgEl = document.createElement('img');
+            imgEl.className = 'gallery-img';
+            imgEl.src = img.url;
+            imgEl.alt = img.etiqueta || img.nombre_archivo || `Imagen ${idx + 1}`;
+            imgEl.loading = 'lazy';
+            imgEl.onclick = () => openLightbox(img.url, img.etiqueta, img.caption);
+            item.appendChild(imgEl);
+
+            if (img.etiqueta || img.nombre_archivo) {
+                const label = document.createElement('div');
+                label.className = 'gallery-label';
+                label.textContent = img.etiqueta || img.nombre_archivo;
+                item.appendChild(label);
+            }
+
+            if (img.caption) {
+                const caption = document.createElement('div');
+                caption.className = 'gallery-caption';
+                caption.textContent = img.caption.substring(0, 120) + (img.caption.length > 120 ? '...' : '');
+                item.appendChild(caption);
+            }
+
+            galleryGrid.appendChild(item);
+        });
+
+        gallery.appendChild(galleryGrid);
+        bubble.appendChild(gallery);
+    }
+
     wrapper.appendChild(bubble);
 
     // Metadata
@@ -334,6 +380,69 @@ function formatBytes(bytes) {
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / 1048576).toFixed(1) + ' MB';
 }
+
+// ── Lightbox for database images ────────────────────────────────────
+function openLightbox(url, title, caption) {
+    // Remove existing lightbox if any
+    const existing = document.getElementById('image-lightbox');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'image-lightbox';
+    overlay.className = 'lightbox-overlay';
+    overlay.onclick = (e) => { if (e.target === overlay) closeLightbox(); };
+
+    const container = document.createElement('div');
+    container.className = 'lightbox-container';
+
+    // Close button
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'lightbox-close';
+    closeBtn.innerHTML = '✕';
+    closeBtn.onclick = closeLightbox;
+    container.appendChild(closeBtn);
+
+    // Image
+    const img = document.createElement('img');
+    img.className = 'lightbox-img';
+    img.src = url;
+    img.alt = title || 'Imagen histológica';
+    container.appendChild(img);
+
+    // Title
+    if (title) {
+        const titleEl = document.createElement('div');
+        titleEl.className = 'lightbox-title';
+        titleEl.textContent = title;
+        container.appendChild(titleEl);
+    }
+
+    // Caption
+    if (caption) {
+        const captionEl = document.createElement('div');
+        captionEl.className = 'lightbox-caption';
+        captionEl.textContent = caption;
+        container.appendChild(captionEl);
+    }
+
+    overlay.appendChild(container);
+    document.body.appendChild(overlay);
+
+    // Close on Escape
+    const escHandler = (e) => {
+        if (e.key === 'Escape') {
+            closeLightbox();
+            document.removeEventListener('keydown', escHandler);
+        }
+    };
+    document.addEventListener('keydown', escHandler);
+}
+
+function closeLightbox() {
+    const lb = document.getElementById('image-lightbox');
+    if (lb) lb.remove();
+}
+
 
 // ── Log ─────────────────────────────────────────────────────────────
 console.log('🔬 RAG Histología Neo4j + A2UI client initialized');

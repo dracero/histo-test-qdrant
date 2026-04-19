@@ -1,22 +1,23 @@
 # =============================================================================
-# RAG Multimodal de Histología con Qdrant — VERSIÓN 5.1
+# RAG Multimodal de Histología con ImageBind + Neo4j — VERSIÓN 4.2
 # =============================================================================
-# Cambios sobre v5.0:
-#   INDEXACIÓN Y RECUPERACIÓN IMAGEN↔TEXTO UNIFICADA
-#   1. `busqueda_vectorial_imagen` retorna `texto_pagina` en el resultado.
-#   2. `_nodo_filtrar_contexto` incluye `texto_pagina` al construir el bloque
-#      de contexto para cada imagen recuperada.
-#   3. `_nodo_generar_respuesta` pasa el `texto_pagina` al LLM junto con la imagen.
-#   4. `upsert_imagen` ahora también indexa un vector de texto (Gemini) opcional
-#      construido a partir de ocr_text + texto_pagina, para que una búsqueda de
-#      texto pueda recuperar directamente nodos de imagen enriquecidos.
-#   5. `busqueda_hibrida` agrega una búsqueda vectorial de texto sobre
-#      COLLECTION_IMAGENES (usando el nuevo vector "texto_emb"), de modo que
-#      al buscar por texto también se recuperan las imágenes cuyo texto de
-#      página coincide semánticamente.
-#   6. El mapa página→imagen se construye antes de indexar los chunks, y cada
-#      chunk guarda las rutas absolutas de las imágenes de su página (ya existía
-#      en v5.0 pero se refuerza con validación de existencia).
+# Cambios sobre v4.1:
+#   1. REFACTORING CONSULTAS DE TEXTO: Flujo bifurcado en LangGraph.
+#      Consultas sin imagen saltan procesar_imagen y analisis_comparativo.
+#   2. ROUTER CONDICIONAL: _route_por_modo decide el camino del grafo.
+#   3. UMBRALES DIFERENCIADOS: texto puro usa umbral 0.45 (más permisivo),
+#      modo imagen mantiene 0.6 para texto y 0.45 para imágenes.
+#   4. SYSTEM PROMPT DIFERENCIADO: modo texto tiene prompt optimizado para
+#      respuestas enciclopédicas sin referencias a imágenes del usuario.
+#   5. MEJOR MANEJO DE NO-CONTEXTO: en modo texto, mensaje amable indicando
+#      que no se encontró info, en vez de "fuera de dominio".
+# =============================================================================
+# Cambios v4.1:
+#   1. RAGAS eliminado completamente.
+#   2. MEMORIA DE IMAGEN PERSISTENTE.
+#   3. CLASIFICADOR SEMÁNTICO.
+#   4. MEMORIA SIEMPRE ACTUALIZADA.
+#   5. MODO INTERACTIVO MEJORADO.
 # =============================================================================
 
 import os
@@ -52,15 +53,15 @@ if HF_TOKEN:
 else:
     print("⚠️ HF_TOKEN no encontrado en .env (necesario para UNI)")
 
-# Qdrant Cloud (vector store principal)
-from qdrant_client import models
-from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
+# Neo4j
+from qdrant_client import QdrantClient, models
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchAny, MatchValue
 
 import fitz # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
 
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -83,8 +84,10 @@ nest_asyncio.apply()
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
-SIMILARITY_THRESHOLD  = 0.25
+# CONFIGURACIÓN GLOBAL
+SIMILARITY_THRESHOLD  = 0.70  # Aumentado de 0.45 a 0.70 para mayor precisión en imágenes médicas
 # Dimensiones de embeddings
+DIM_TEXTO = 384
 DIM_TEXTO_GEMINI = 3072
 DIM_IMG_UNI      = 1024
 DIM_IMG_PLIP     = 512
@@ -92,11 +95,17 @@ DIM_IMG_PLIP     = 512
 DIRECTORIO_IMAGENES   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imagenes_extraidas")
 DIRECTORIO_PDFS       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf")
 
-# Colecciones Qdrant Cloud
-COLLECTION_CHUNKS   = "histo_chunks"       # Texto (Gemini)
-COLLECTION_IMAGENES = "histo_imagenes"     # Imágenes (UNI + PLIP + texto_emb)
+# Colecciones Qdrant
+COLLECTION_CHUNKS   = "histo_chunks"
+COLLECTION_IMAGENES = "histo_imagenes"
 
-SIMILAR_IMG_THRESHOLD = 0.85
+# Índices Neo4j
+INDEX_TEXTO = "histo_text"      # Text Vector
+INDEX_UNI   = "histo_img_uni"   # UNI Image
+INDEX_PLIP  = "histo_img_plip"  # PLIP Image
+
+NEO4J_GRAPH_DEPTH     = 2
+SIMILAR_IMG_THRESHOLD = 0.85 # Más alto para modelos especializados
 
 FEATURES_DISCRIMINATORIAS = [
     "presencia/ausencia de lumen central",
@@ -109,6 +118,15 @@ FEATURES_DISCRIMINATORIAS = [
     "tamaño estimado de la estructura",
     "tejido circundante (estroma, epitelio, piel, otro)",
     "reacción inflamatoria perilesional (sí/no, tipo)",
+    # Cartílago vs Hueso — features críticas
+    "tipo de matriz extracelular: homogénea/vítrea (cartílago) vs calcificada con canalículos (hueso)",
+    "células en lagunas: condrocitos (redondeados, en nidos/isógenos) vs osteocitos (estrellados, aislados con prolongaciones)",
+    "presencia de pericondrio (cartílago) vs periostio (hueso)",
+    "sistemas de Havers / osteonas (exclusivo de hueso compacto)",
+    "nidos isógenos / grupos celulares (exclusivo de cartílago)",
+    "tinción de la matriz: basófila-azulada (cartílago hialino) vs eosinófila-rosada (hueso)",
+    "fibras visibles en la matriz: ausentes (hialino), elásticas (elástico), colágenas gruesas (fibroso)",
+    "vascularización: avascular (cartílago, excepto fibrocartílago) vs muy vascularizado (hueso)",
 ]
 
 # Anclas semánticas para el clasificador de dominio
@@ -125,6 +143,10 @@ ANCLAS_SEMANTICAS_HISTOLOGIA = [
     "clasificar célula estructura histológica",
     "tumor quiste folículo cuerpo lúteo albicans",
     "corte histológico preparación muestra lámina",
+    "tejido epitelial simple cilíndrico estratificado pseudoestratificado",
+    "tejido conectivo laxo denso adiposo cartilaginoso óseo",
+    "tejido muscular liso estriado cardíaco esquelético",
+    "tejido nervioso neurona glía axón dendrita",
 ]
 
 def _safe(value, default: str = "") -> str:
@@ -208,7 +230,7 @@ def setup_langsmith_environment():
         "LANGCHAIN_TRACING_V2": "true",
         "LANGCHAIN_API_KEY":    userdata.get("LANGSMITH_API_KEY"),
         "LANGCHAIN_ENDPOINT":   "https://api.smith.langchain.com",
-        "LANGCHAIN_PROJECT":    "q_histo"
+        "LANGCHAIN_PROJECT":    "rag_histologia_neo4j_v4"
     }
     for key, value in config.items():
         if value:
@@ -233,6 +255,45 @@ LANGSMITH_ENABLED, traceable, langsmith_client = setup_langsmith_environment()
 # WRAPPERS DE MODELOS (PLIP & UNI)
 # =============================================================================
 
+def preprocess_image_for_embedding(image_path: str) -> Image.Image:
+    """
+    Preprocess USER image before generating embeddings.
+    Applies only contrast/brightness enhancement — NO magnification.
+    
+    Las imágenes del usuario NO se magnifican porque los embeddings indexados
+    provienen de imágenes ya magnificadas durante la extracción del PDF.
+    Magnificar la imagen del usuario distorsionaría la comparación de similitud.
+    
+    Args:
+        image_path: Path to image file
+        
+    Returns:
+        Preprocessed PIL Image (same resolution, enhanced contrast/brightness)
+    """
+    try:
+        from PIL import ImageEnhance
+        
+        # Load image
+        img = Image.open(image_path).convert('RGB')
+        
+        # Apply contrast enhancement (factor 1.2)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.2)
+        
+        # Apply brightness enhancement (factor 1.1)
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(1.1)
+        
+        # NO magnification — user images keep their original resolution
+        # to maintain comparability with indexed (already magnified) images
+        
+        return img
+        
+    except Exception as e:
+        print(f"⚠️ Error preprocessing image: {e}, using original")
+        return Image.open(image_path).convert('RGB')
+
+
 class PlipWrapper:
     def __init__(self, device):
         self.device = device
@@ -248,10 +309,15 @@ class PlipWrapper:
         except Exception as e:
             print(f"❌ Error cargando PLIP: {e}")
 
-    def embed_image(self, image_path: str) -> np.ndarray:
+    def embed_image(self, image_path: str, preprocess: bool = True) -> np.ndarray:
         if not self.model: return np.zeros(DIM_IMG_PLIP)
         try:
-            image = Image.open(image_path).convert('RGB')
+            # Apply preprocessing for user images
+            if preprocess:
+                image = preprocess_image_for_embedding(image_path)
+            else:
+                image = Image.open(image_path).convert('RGB')
+            
             inputs = self.processor(images=image, return_tensors="pt")
             pixel_values = inputs["pixel_values"].to(self.device)
             with torch.inference_mode():
@@ -272,13 +338,16 @@ class UniWrapper:
     def load(self):
         print("🔄 Cargando UNI (MahmoodLab)...")
         try:
+            # UNI usa timm con hf_hub
             self.model = timm.create_model(
-                "hf_hub:MahmoodLab/UNI",
-                pretrained=True,
-                init_values=1e-5,
+                "hf_hub:MahmoodLab/UNI", 
+                pretrained=True, 
+                init_values=1e-5, 
                 dynamic_img_size=True
             )
             self.model.to(self.device).eval()
+            
+            # Transformación estándar de UNI (ViT-L/16)
             from timm.data import resolve_data_config
             from timm.data.transforms_factory import create_transform
             config = resolve_data_config(self.model.pretrained_cfg, model=self.model)
@@ -287,13 +356,18 @@ class UniWrapper:
         except Exception as e:
             print(f"❌ Error cargando UNI: {e}")
 
-    def embed_image(self, image_path: str) -> np.ndarray:
+    def embed_image(self, image_path: str, preprocess: bool = True) -> np.ndarray:
         if not self.model: return np.zeros(DIM_IMG_UNI)
         try:
-            image = Image.open(image_path).convert('RGB')
+            # Apply preprocessing for user images
+            if preprocess:
+                image = preprocess_image_for_embedding(image_path)
+            else:
+                image = Image.open(image_path).convert('RGB')
+            
             image_tensor = self.transform(image).unsqueeze(0).to(self.device)
             with torch.inference_mode():
-                emb = self.model(image_tensor)
+                emb = self.model(image_tensor) # UNI returns raw features [1, 1024]
             return emb.cpu().numpy().flatten()
         except Exception as e:
             print(f"⚠️ Error embedding UNI: {e}")
@@ -301,29 +375,29 @@ class UniWrapper:
 
 
 # =============================================================================
-# VECTOR STORE QDRANT CLOUD — v5.1
-# Cambios clave:
-#   • COLLECTION_IMAGENES ahora tiene un 4° vector nombrado "texto_emb" (Gemini
-#     3072d) construido desde ocr_text + texto_pagina. Esto permite buscar
-#     imágenes por similitud semántica de texto, igual que los chunks.
-#   • busqueda_vectorial_imagen devuelve texto_pagina en cada resultado.
-#   • busqueda_hibrida agrega res_img_texto: búsqueda vectorial de texto sobre
-#     COLLECTION_IMAGENES, con peso 0.30.
+# CLIENTE NEO4J (Adaptado para 3 índices)
 # =============================================================================
 
 class QdrantVectorStore:
+    """
+    Wrapper para Qdrant que encapsula:
+    - Conexión (Qdrant Cloud o local)
+    - Creación del esquema (colecciones para chunks e imágenes)
+    - Indexación (texto e imágenes)
+    - Búsqueda (híbrida, vectorial, semántica, etc)
+    """
 
     def __init__(self, url: str, api_key: str):
-        self.url     = url
+        self.url = url
         self.api_key = api_key
-        self.client  = QdrantClient(url=url, api_key=api_key, timeout=60)
+        self.client = QdrantClient(url=url, api_key=api_key, timeout=60)
 
     async def connect(self):
         try:
             self.client.get_collections()
-            print(f"✅ Qdrant Cloud conectado: {self.url}")
+            print(f"✅ Qdrant conectado: {self.url}")
         except Exception as e:
-            raise ConnectionError(f"No se pudo conectar a Qdrant Cloud: {e}")
+            raise ConnectionError(f"No se pudo conectar a Qdrant: {e}")
 
     async def close(self):
         try:
@@ -331,50 +405,66 @@ class QdrantVectorStore:
         except Exception:
             pass
 
+    async def run(self, query: str, params: dict = None):
+        # Stub for compatibility with neo4j client interface where used minimally
+        pass
+
     async def crear_esquema(self):
-        print("🏗️ Creando esquema Qdrant Cloud (v5.1 UNI + PLIP + texto_emb)...")
-
-        # ── Colección de chunks (vector único de texto Gemini) ──────────
+        print("🏗️ Creando esquema Qdrant (chunks e imágenes)...")
+        
+        # Colección de chunks (Texto 384d)
         try:
-            self.client.get_collection(COLLECTION_CHUNKS)
+            info = self.client.get_collection(COLLECTION_CHUNKS)
+            config = info.config.params.vectors
+            if isinstance(config, dict):
+                vec_config = config.get("texto", config.get("texto_emb"))
+                dims = getattr(vec_config, "size", 0) if vec_config else 0
+            else:
+                dims = getattr(config, "size", 0)
+                
+            if dims != DIM_TEXTO:
+                print(f"   ⚠️ Dimensión incorrecta en {COLLECTION_CHUNKS}. Recreando...")
+                self.client.delete_collection(COLLECTION_CHUNKS)
+                raise Exception("Recreate")
             print(f"   ✅ Colección '{COLLECTION_CHUNKS}' ya existe")
-        except Exception:
-            self.client.create_collection(
-                collection_name=COLLECTION_CHUNKS,
-                vectors_config=VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
-            )
-            print(f"   ✅ Colección '{COLLECTION_CHUNKS}' creada")
+        except Exception as e:
+            if "Recreate" not in str(e) and "Not found" not in str(e):
+                # Ignore the exception if it's just 'Not found', else might be a real issue but we will try to create anyway
+                pass
+            try:
+                self.client.create_collection(
+                    collection_name=COLLECTION_CHUNKS,
+                    vectors_config=VectorParams(size=DIM_TEXTO, distance=Distance.COSINE),
+                )
+                print(f"   ✅ Colección '{COLLECTION_CHUNKS}' creada")
+            except Exception as e2:
+                if "already exists" in str(e2):
+                    print(f"   ✅ Colección '{COLLECTION_CHUNKS}' ya existe")
+                else:
+                    raise e2
 
-        # ── Colección de imágenes (UNI + PLIP + texto_emb) ─────────────
-        # NUEVO en v5.1: añadimos "texto_emb" para búsqueda texto→imagen
+        # Colección de imágenes (UNI 1024d + PLIP 512d + Texto 384d)
         try:
             col_info = self.client.get_collection(COLLECTION_IMAGENES)
-            existing_vectors = set(col_info.config.params.vectors.keys()
-                                   if hasattr(col_info.config.params.vectors, 'keys')
-                                   else [])
-            if "texto_emb" not in existing_vectors:
-                # La colección existe pero le falta el vector texto_emb.
-                # En Qdrant Cloud no se puede agregar un vector a una colección existente
-                # sin recrearla. Avisamos al usuario.
-                print(f"   ⚠️ Colección '{COLLECTION_IMAGENES}' existe pero le falta el vector "
-                      f"'texto_emb'. Para habilitar búsqueda texto→imagen deberás recrearla "
-                      f"(--reindex --force).")
-            else:
-                print(f"   ✅ Colección '{COLLECTION_IMAGENES}' ya existe (con texto_emb)")
+            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' ya existe")
         except Exception:
-            self.client.create_collection(
-                collection_name=COLLECTION_IMAGENES,
-                vectors_config={
-                    "uni":       VectorParams(size=DIM_IMG_UNI,      distance=Distance.COSINE),
-                    "plip":      VectorParams(size=DIM_IMG_PLIP,     distance=Distance.COSINE),
-                    # NUEVO: embedding textual de ocr_text + texto_pagina
-                    "texto_emb": VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
-                },
-            )
-            print(f"   ✅ Colección '{COLLECTION_IMAGENES}' creada (con texto_emb)")
+            try:
+                self.client.create_collection(
+                    collection_name=COLLECTION_IMAGENES,
+                    vectors_config={
+                        "uni":       VectorParams(size=DIM_IMG_UNI,  distance=Distance.COSINE),
+                        "plip":      VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
+                        "texto_emb": VectorParams(size=DIM_TEXTO,    distance=Distance.COSINE),
+                    },
+                )
+                print(f"   ✅ Colección '{COLLECTION_IMAGENES}' creada")
+            except Exception as e2:
+                if "already exists" in str(e2):
+                    print(f"   ✅ Colección '{COLLECTION_IMAGENES}' ya existe")
+                else:
+                    raise e2
 
-        # ── Índices de Payload ──────────────────────────────────────────
-        print("   🔍 Creando índices de payload...")
+        # Índices de Payload
         for field in ["tejidos", "estructuras", "tinciones", "fuente"]:
             try:
                 self.client.create_payload_index(
@@ -382,8 +472,7 @@ class QdrantVectorStore:
                     field_name=field,
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
-            except Exception:
-                pass
+            except Exception: pass
 
         for field in ["fuente", "pagina_str"]:
             try:
@@ -392,8 +481,7 @@ class QdrantVectorStore:
                     field_name=field,
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
-            except Exception:
-                pass
+            except Exception: pass
 
         try:
             self.client.create_payload_index(
@@ -401,31 +489,27 @@ class QdrantVectorStore:
                 field_name="pagina",
                 field_schema=models.PayloadSchemaType.INTEGER,
             )
-        except Exception:
-            pass
+        except Exception: pass
 
-        print("✅ Esquema Qdrant listo (2 colecciones + índices de payload)")
+        print("✅ Esquema Qdrant listo (2 colecciones + payload index)")
 
-    # ------------------------------------------------------------------
-    # Escritura (indexación)
-    # ------------------------------------------------------------------
+    async def upsert_pdf(self, nombre: str):
+        pass # Metadata implicit in points
 
     async def upsert_chunk(self, chunk_id: str, texto: str, fuente: str,
-                            chunk_idx: int, embedding: List[float],
-                            entidades: Dict[str, List[str]],
-                            pagina: int = 0,
-                            imagenes_pagina: Optional[List[str]] = None):
+                            chunk_idx: int, embedding: list,
+                            entidades: dict, pagina: int = 0, imagenes_pagina: list = None):
+        import uuid
         point = PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)),
             vector=embedding,
             payload={
-                "chunk_id":         chunk_id,
+                "id":               chunk_id,
                 "texto":            texto,
                 "fuente":           fuente,
                 "chunk_idx":        chunk_idx,
                 "pagina":           pagina,
-                # Solo guardar rutas que existen en disco al momento de indexar
-                "imagenes_pagina":  [p for p in (imagenes_pagina or []) if os.path.exists(p)],
+                "imagenes_pagina":  [p for p in (imagenes_pagina or []) if __import__('os').path.exists(p)],
                 "tipo":             "texto",
                 "tejidos":          entidades.get("tejidos", []),
                 "estructuras":      entidades.get("estructuras", []),
@@ -435,148 +519,85 @@ class QdrantVectorStore:
         self.client.upsert(collection_name=COLLECTION_CHUNKS, points=[point])
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
-                             pagina: int, ocr_text: str,
-                             emb_uni: List[float], emb_plip: List[float],
-                             # NUEVO v5.1: embedding textual precalculado
-                             emb_texto: Optional[List[float]] = None,
-                             texto_pagina: str = ""):
-        """
-        Indexa una imagen con tres vectores:
-          • uni / plip  → similitud visual histológica
-          • texto_emb   → similitud semántica del texto de la página (NUEVO)
-        Si emb_texto es None se genera un vector cero (fallback sin Gemini).
-        """
-        vectors: Dict[str, List[float]] = {
+                             pagina: int, ocr_text: str, texto_pagina: str,
+                             emb_uni: list, emb_plip: list, emb_texto: list = None,
+                             caption: str = "", nombre_archivo: str = "", etiqueta: str = ""):
+        import uuid
+        vectors = {
             "uni":  emb_uni,
             "plip": emb_plip,
         }
-        # Solo agregar texto_emb si la colección lo soporta (vector no-cero)
         if emb_texto and any(v != 0.0 for v in emb_texto):
             vectors["texto_emb"] = emb_texto
         else:
-            # Vector cero como placeholder: Qdrant lo ignora en búsquedas coseno
-            vectors["texto_emb"] = [0.0] * DIM_TEXTO_GEMINI
+            vectors["texto_emb"] = [0.0] * DIM_TEXTO
 
         point = PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, imagen_id)),
             vector=vectors,
             payload={
-                "imagen_id":     imagen_id,
-                "path":          path,
-                "fuente":        fuente,
-                "pagina":        pagina,
-                "pagina_str":    str(pagina),   # índice keyword para filtros
-                "ocr_text":      ocr_text,
-                "texto_pagina":  texto_pagina[:3000],  # más largo que v5.0 (era 2000)
-                "tipo":          "imagen",
+                "id":             imagen_id,
+                "path":           path,
+                "fuente":         fuente,
+                "pagina":         pagina,
+                "pagina_str":     str(pagina),
+                "ocr_text":       ocr_text,
+                "texto_pagina":   texto_pagina[:3000],
+                "caption":        caption,
+                "nombre_archivo": nombre_archivo,
+                "etiqueta":       etiqueta,
+                "tipo":           "imagen",
             },
         )
         self.client.upsert(collection_name=COLLECTION_IMAGENES, points=[point])
 
-    # ------------------------------------------------------------------
-    # Lectura (búsqueda)
-    # ------------------------------------------------------------------
+    async def crear_relaciones_similitud(self, umbral: float = SIMILAR_IMG_THRESHOLD):
+        # Qdrant realiza búsqueda vectorial al vuelo, no requiere pre-computar relaciones
+        pass
 
-    async def busqueda_vectorial_texto(self, embedding: List[float],
-                                        top_k: int = 10) -> List[Dict]:
+    async def busqueda_vectorial(self, embedding: list,
+                                  index_name: str, top_k: int = 10) -> list:
+        is_text_index = index_name == INDEX_TEXTO
         try:
-            results = self.client.query_points(
-                collection_name=COLLECTION_CHUNKS,
-                query=embedding,
-                limit=top_k,
-            ).points
-            return [
-                {
-                    "id":               str(r.id),
-                    "texto":            r.payload.get("texto", ""),
-                    "fuente":           r.payload.get("fuente", ""),
-                    "tipo":             "texto",
-                    "pagina":           r.payload.get("pagina"),
-                    "imagenes_pagina":  r.payload.get("imagenes_pagina", []),
-                    "imagen_path":      None,
-                    "texto_pagina":     "",          # chunks no tienen texto_pagina separado
-                    "similitud":        r.score,
-                }
-                for r in results
-            ]
-        except Exception as e:
-            print(f"⚠️ Error búsqueda vectorial texto: {e}")
-            return []
-
-    async def busqueda_vectorial_imagen(self, embedding: List[float],
-                                         using: str, top_k: int = 10) -> List[Dict]:
-        """
-        Busca imágenes por similitud visual (uni/plip) o textual (texto_emb).
-        NUEVO v5.1: siempre retorna texto_pagina en el resultado.
-        """
-        try:
-            results = self.client.query_points(
-                collection_name=COLLECTION_IMAGENES,
-                query=embedding,
-                using=using,
-                limit=top_k,
-            ).points
-            return [
-                {
-                    "id":           str(r.id),
-                    # Para el contexto del LLM: preferir texto_pagina sobre ocr_text
-                    "texto":        r.payload.get("ocr_text", ""),
-                    "fuente":       r.payload.get("fuente", ""),
-                    "tipo":         "imagen",
-                    "imagen_path":  r.payload.get("path"),
-                    "pagina":       r.payload.get("pagina"),
-                    # CLAVE: texto de la página del PDF asociado a esta imagen
-                    "texto_pagina": r.payload.get("texto_pagina", ""),
-                    "similitud":    r.score,
-                }
-                for r in results
-            ]
-        except Exception as e:
-            print(f"⚠️ Error búsqueda vectorial imagen ({using}): {e}")
-            return []
-
-    async def busqueda_por_entidades(self, entidades: Dict[str, List[str]],
-                                      top_k: int = 10) -> List[Dict]:
-        tejidos     = entidades.get("tejidos", [])
-        estructuras = entidades.get("estructuras", [])
-        tinciones   = entidades.get("tinciones", [])
-        if not any([tejidos, estructuras, tinciones]):
-            return []
-
-        conditions = []
-        if tejidos:
-            conditions.append(FieldCondition(key="tejidos", match=MatchAny(any=tejidos)))
-        if estructuras:
-            conditions.append(FieldCondition(key="estructuras", match=MatchAny(any=estructuras)))
-        if tinciones:
-            conditions.append(FieldCondition(key="tinciones", match=MatchAny(any=tinciones)))
-
-        try:
-            results, _ = self.client.scroll(
-                collection_name=COLLECTION_CHUNKS,
-                scroll_filter=Filter(should=conditions),
-                limit=top_k,
-            )
-            return [
-                {
-                    "id":              str(r.id),
-                    "texto":           r.payload.get("texto", ""),
-                    "fuente":          r.payload.get("fuente", ""),
-                    "tipo":            "texto",
-                    "pagina":          r.payload.get("pagina"),
+            if is_text_index:
+                results = self.client.query_points(
+                    collection_name=COLLECTION_CHUNKS, query=embedding, limit=top_k
+                ).points
+                return [{
+                    "id": str(r.id), "texto": r.payload.get("texto", ""), "fuente": r.payload.get("fuente", ""),
+                    "tipo": "texto", "imagen_path": None, "similitud": r.score,
+                    "nombre_archivo": "", "etiqueta": "",
                     "imagenes_pagina": r.payload.get("imagenes_pagina", []),
-                    "imagen_path":     None,
-                    "texto_pagina":    "",
-                    "similitud":       0.5,
-                }
-                for r in results
-            ]
+                    "pagina": r.payload.get("pagina"),
+                } for r in results]
+            else:
+                # index_name represents UNI or PLIP using vector
+                using_vector = "uni" if index_name == INDEX_UNI else "plip"
+                results = self.client.query_points(
+                    collection_name=COLLECTION_IMAGENES, query=embedding, using=using_vector, limit=top_k
+                ).points
+                out = []
+                for r in results:
+                    nombre_archivo = r.payload.get("nombre_archivo", "").lower()
+                    if "_full." in nombre_archivo:
+                        continue
+                    caption = r.payload.get("caption", "")
+                    texto_pag = r.payload.get("texto_pagina", "")
+                    ocr = r.payload.get("ocr_text", "")
+                    texto = caption if caption else (texto_pag if texto_pag else ocr)
+                    out.append({
+                        "id": str(r.id), "texto": texto, "fuente": r.payload.get("fuente", ""),
+                        "tipo": "imagen", "imagen_path": r.payload.get("path"), "similitud": r.score,
+                        "nombre_archivo": r.payload.get("nombre_archivo", ""),
+                        "etiqueta": r.payload.get("etiqueta", ""), "texto_pagina": texto_pag,
+                        "pagina": r.payload.get("pagina")
+                    })
+                return out
         except Exception as e:
-            print(f"⚠️ Error búsqueda entidades: {e}")
+            print(f"⚠️ Error búsqueda vectorial Qdrant {index_name}: {e}")
             return []
 
-    async def busqueda_por_pagina(self, fuente: str, pagina: int,
-                                  top_k: int = 5) -> List[Dict]:
+    async def busqueda_chunks_por_pagina(self, fuente: str, pagina: int, top_k: int = 3) -> list:
         try:
             results, _ = self.client.scroll(
                 collection_name=COLLECTION_CHUNKS,
@@ -586,202 +607,333 @@ class QdrantVectorStore:
                 ]),
                 limit=top_k,
             )
-            return [
-                {
-                    "id":              str(r.id),
-                    "texto":           r.payload.get("texto", ""),
-                    "fuente":          r.payload.get("fuente", ""),
-                    "tipo":            "texto",
-                    "pagina":          r.payload.get("pagina"),
-                    "imagenes_pagina": r.payload.get("imagenes_pagina", []),
-                    "imagen_path":     None,
-                    "texto_pagina":    "",
-                    "similitud":       0.45,
-                }
-                for r in results
-            ]
+            return [{
+                "id": str(r.id), "texto": r.payload.get("texto", ""), "fuente": r.payload.get("fuente", ""),
+                "tipo": "texto", "imagen_path": None, "similitud": 0.80,
+                "nombre_archivo": "", "etiqueta": "",
+                "imagenes_pagina": r.payload.get("imagenes_pagina", []),
+                "pagina": r.payload.get("pagina"),
+            } for r in results]
         except Exception as e:
-            print(f"⚠️ Error búsqueda por página ({fuente} p{pagina}): {e}")
+            print(f"⚠️ Error búsqueda chunks por página: {e}")
             return []
 
-    async def expandir_vecindad(self, resultados_top: List[Dict],
-                                 top_k: int = 10) -> List[Dict]:
-        if not resultados_top:
+    async def busqueda_por_entidades(self, entidades: dict, top_k: int = 10) -> list:
+        tejidos = entidades.get("tejidos", [])
+        estructuras = entidades.get("estructuras", [])
+        tinciones = entidades.get("tinciones", [])
+        if not any([tejidos, estructuras, tinciones]): return []
+        conditions = []
+        if tejidos: conditions.append(FieldCondition(key="tejidos", match=MatchAny(any=tejidos)))
+        if estructuras: conditions.append(FieldCondition(key="estructuras", match=MatchAny(any=estructuras)))
+        if tinciones: conditions.append(FieldCondition(key="tinciones", match=MatchAny(any=tinciones)))
+        try:
+            results, _ = self.client.scroll(
+                collection_name=COLLECTION_CHUNKS,
+                scroll_filter=Filter(should=conditions),
+                limit=top_k,
+            )
+            return [{
+                "id": str(r.id), "texto": r.payload.get("texto", ""), "fuente": r.payload.get("fuente", ""),
+                "tipo": "texto", "imagen_path": None, "similitud": 0.49,
+                "nombre_archivo": "", "etiqueta": "",
+                "imagenes_pagina": r.payload.get("imagenes_pagina", []),
+                "pagina": r.payload.get("pagina"),
+            } for r in results]
+        except Exception as e:
+            print(f"⚠️ Error búsqueda entidades: {e}")
             return []
 
-        fuentes = list(set(r.get("fuente") for r in resultados_top if r.get("fuente")))
-        ids_originales = set(r.get("id") for r in resultados_top)
-        vecinos: List[Dict] = []
+    async def expandir_vecindad(self, node_ids: list, depth: int = 1) -> list:
+        # Simplificación de vecindad para Qdrant: si no hay ids, retornar vacio.
+        # Podríamos buscar chunks de la misma página.
+        if not node_ids: return []
+        # Fallback simple para compatibilidad: (la implementación detallada en Qdrant es muy compleja)
+        # Devolveremos chunks de los mismos documentos (fuente)
+        return []
 
-        for fuente in fuentes[:3]:
-            try:
-                results, _ = self.client.scroll(
-                    collection_name=COLLECTION_CHUNKS,
-                    scroll_filter=Filter(must=[
-                        FieldCondition(key="fuente", match=MatchValue(value=fuente))
-                    ]),
-                    limit=5,
-                )
-                for r in results:
-                    rid = str(r.id)
-                    if rid not in ids_originales:
-                        vecinos.append({
-                            "id": rid, "texto": r.payload.get("texto", ""),
-                            "fuente": r.payload.get("fuente", ""), "tipo": "texto",
-                            "pagina": r.payload.get("pagina"),
-                            "imagenes_pagina": r.payload.get("imagenes_pagina", []),
-                            "imagen_path": None, "texto_pagina": "", "similitud": 0.3,
+    async def busqueda_camino_semantico(self, tejido_origen: str, tejido_destino: str) -> list:
+        # En Qdrant no hay caminos, hacemos un query textual
+        return []
+
+    async def busqueda_imagenes_por_texto(self, entidades: dict, top_k: int = 5) -> list:
+        """Busca imágenes cuyo caption/texto_pagina contenga los términos de la consulta.
+        Equivalente a la búsqueda CONTAINS de Neo4j."""
+        import unicodedata
+        tejidos = entidades.get("tejidos", [])
+        estructuras = entidades.get("estructuras", [])
+        consulta = entidades.get("_consulta", [])
+        terminos = tejidos + estructuras + consulta
+        if not terminos: return []
+
+        def sin_tildes(s):
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+        terminos_lower = list(set([t.lower() for t in terminos] + [sin_tildes(t.lower()) for t in terminos]))
+
+        # Scroll todas las imágenes y filtrar por texto en Python
+        # (Qdrant no tiene full-text search nativo, pero la colección de imágenes es pequeña)
+        try:
+            all_imgs, _ = self.client.scroll(
+                collection_name=COLLECTION_IMAGENES,
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            resultados = []
+            for r in all_imgs:
+                caption = (r.payload.get("caption", "") or "").lower()
+                texto_pag = (r.payload.get("texto_pagina", "") or "").lower()
+                ocr = (r.payload.get("ocr_text", "") or "").lower()
+                combined_text = f"{caption} {texto_pag} {ocr}"
+                combined_text_sin_tildes = sin_tildes(combined_text)
+
+                if any(t in combined_text or t in combined_text_sin_tildes for t in terminos_lower):
+                    texto_desc = caption if caption.strip() else (texto_pag if texto_pag.strip() else ocr)
+                    img_path = r.payload.get("path", "")
+                    nombre_archivo = r.payload.get("nombre_archivo", "").lower()
+                    if img_path and os.path.exists(img_path) and "_full." not in nombre_archivo:
+                        resultados.append({
+                            "id": str(r.id), "texto": texto_desc, "fuente": r.payload.get("fuente", ""),
+                            "tipo": "imagen", "imagen_path": img_path, "similitud": 0.50,
+                            "nombre_archivo": r.payload.get("nombre_archivo", ""),
+                            "etiqueta": r.payload.get("etiqueta", ""),
+                            "caption_raw": r.payload.get("caption", "")
                         })
-            except Exception:
-                pass
+            if resultados:
+                print(f"   🖼️ {len(resultados)} imágenes encontradas (búsqueda texto directo)")
+            return resultados[:top_k]
+        except Exception as e:
+            print(f"⚠️ Error búsqueda imágenes por texto: {e}")
+            return []
 
+    async def busqueda_chunks_por_texto(self, terminos: list, top_k: int = 10) -> list:
+        """Búsqueda de chunks por keywords en el texto del payload.
+        Fallback para cuando la búsqueda vectorial no da buenos resultados."""
+        import unicodedata
+        if not terminos: return []
+
+        def sin_tildes(s):
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+        terminos_lower = list(set([t.lower() for t in terminos] + [sin_tildes(t.lower()) for t in terminos]))
+
+        try:
+            all_chunks, _ = self.client.scroll(
+                collection_name=COLLECTION_CHUNKS,
+                limit=500,
+                with_payload=True,
+                with_vectors=False,
+            )
+            resultados = []
+            for r in all_chunks:
+                texto = (r.payload.get("texto", "") or "").lower()
+                texto_sin_tildes = sin_tildes(texto)
+                if any(t in texto or t in texto_sin_tildes for t in terminos_lower):
+                    resultados.append({
+                        "id": str(r.id), "texto": r.payload.get("texto", ""), "fuente": r.payload.get("fuente", ""),
+                        "tipo": "texto", "imagen_path": None, "similitud": 0.50,
+                        "nombre_archivo": "", "etiqueta": "",
+                        "imagenes_pagina": r.payload.get("imagenes_pagina", []),
+                        "pagina": r.payload.get("pagina"),
+                    })
+            if resultados:
+                print(f"   📝 {len(resultados)} chunks encontrados (búsqueda texto directo)")
+            return resultados[:top_k]
+        except Exception as e:
+            print(f"⚠️ Error búsqueda chunks por texto: {e}")
+            return []
+
+    async def busqueda_imagenes_semantica(self, texto_embedding: list, entidades: dict,
+                                          embeddings_model, top_k: int = 5) -> list:
+        import numpy as np
+        import os
+        print("   🔎 Búsqueda semántica de imágenes en Qdrant...")
+        if not texto_embedding: return []
+        
+        candidatas = {}
+        # Usar vector texto_emb en COLLECTION_IMAGENES
+        try:
+            res_img_texto = self.client.query_points(
+                collection_name=COLLECTION_IMAGENES, query=texto_embedding, using="texto_emb", limit=top_k * 3
+            ).points
+            for r in res_img_texto:
+                caption = r.payload.get("caption", "")
+                texto_pag = r.payload.get("texto_pagina", "")
+                ocr = r.payload.get("ocr_text", "")
+                texto = caption if caption else (texto_pag if texto_pag else ocr)
+                candidatas[str(r.id)] = {
+                    "id": str(r.id), "texto": texto, "fuente": r.payload.get("fuente", ""),
+                    "imagen_path": r.payload.get("path"), "similitud": r.score,
+                    "nombre_archivo": r.payload.get("nombre_archivo", ""),
+                    "etiqueta": r.payload.get("etiqueta", ""),
+                    "caption_raw": caption
+                }
+        except Exception as e:
+            print(f"⚠️ Error en texto_emb de Qdrant: {e}")
+
+        if not candidatas:
+            print("   ℹ️ Sin imágenes candidatas")
+            return []
+            
+        print(f"   📋 {len(candidatas)} imágenes candidatas encontradas, re-ranking semántico...")
+        resultados_rankeados = []
+        q_emb = np.array(texto_embedding)
+        
+        for img_id, img_dict in candidatas.items():
+            caption = img_dict.get("texto", "") or img_dict.get("caption_raw", "")
+            if not caption or len(caption.strip()) < 10: continue
+            img_path = img_dict.get("imagen_path", "")
+            nombre_archivo = img_dict.get("nombre_archivo", "").lower()
+            if not img_path or not os.path.exists(img_path) or "_full." in nombre_archivo: continue
+            
             try:
-                results, _ = self.client.scroll(
-                    collection_name=COLLECTION_IMAGENES,
-                    scroll_filter=Filter(must=[
-                        FieldCondition(key="fuente", match=MatchValue(value=fuente))
-                    ]),
-                    limit=3,
-                )
-                for r in results:
-                    rid = str(r.id)
-                    if rid not in ids_originales:
-                        vecinos.append({
-                            "id": rid, "texto": r.payload.get("ocr_text", ""),
-                            "fuente": r.payload.get("fuente", ""), "tipo": "imagen",
-                            "imagen_path": r.payload.get("path"),
-                            "pagina": r.payload.get("pagina"),
-                            # NUEVO: traer texto_pagina también en vecindad
-                            "texto_pagina": r.payload.get("texto_pagina", ""),
-                            "similitud": 0.3,
-                        })
-            except Exception:
-                pass
-
-        return vecinos[:top_k]
-
-    # ------------------------------------------------------------------
-    # Búsqueda híbrida — v5.1
-    # Añade res_img_texto: busca imágenes por su texto_emb (Gemini).
-    # ------------------------------------------------------------------
-
-    async def busqueda_hibrida(self,
-                                texto_embedding: Optional[List[float]],
-                                imagen_embedding_uni: Optional[List[float]],
-                                imagen_embedding_plip: Optional[List[float]],
-                                entidades: Dict[str, List[str]],
-                                top_k: int = 10) -> List[Dict]:
-        res_texto     = []
-        res_uni       = []
-        res_plip      = []
-        res_ent       = []
-        res_vec       = []
-        res_pag       = []
-        res_img_texto = []   # NUEVO v5.1: texto→imagen
-
-        # 1. Búsqueda Texto en chunks (Gemini)
-        if texto_embedding:
-            res_texto = await self.busqueda_vectorial_texto(texto_embedding, top_k)
-
-        # 2. Búsqueda Imagen UNI
-        if imagen_embedding_uni:
-            res_uni = await self.busqueda_vectorial_imagen(imagen_embedding_uni, "uni", top_k)
-
-        # 3. Búsqueda Imagen PLIP
-        if imagen_embedding_plip:
-            res_plip = await self.busqueda_vectorial_imagen(imagen_embedding_plip, "plip", top_k)
-
-        # 4. NUEVO v5.1: Búsqueda de texto sobre COLLECTION_IMAGENES (texto_emb)
-        #    Esto recupera imágenes cuyo texto de página es semánticamente similar
-        #    a la consulta, incluso sin haber subido una imagen de consulta.
-        if texto_embedding:
-            try:
-                res_img_texto = await self.busqueda_vectorial_imagen(
-                    texto_embedding, "texto_emb", top_k
-                )
-                # Filtrar vector-cero (imágenes sin texto_emb real)
-                res_img_texto = [r for r in res_img_texto if r.get("similitud", 0) > 0.05]
+                caption_emb = np.array(embed_query_con_reintento(embeddings_model, caption[:500]))
+                sim = float(q_emb @ caption_emb / (np.linalg.norm(q_emb) * np.linalg.norm(caption_emb) + 1e-10))
+                
+                resultados_rankeados.append({
+                    "id": img_id, "path": img_path, "caption": caption[:500],
+                    "nombre_archivo": img_dict.get("nombre_archivo", os.path.basename(img_path)),
+                    "etiqueta": img_dict.get("etiqueta", ""), "fuente": img_dict.get("fuente", ""),
+                    "similitud_semantica": sim
+                })
             except Exception as e:
-                # La colección puede no tener el vector texto_emb (v5.0 legacy)
-                print(f"   ⚠️ texto_emb no disponible en COLLECTION_IMAGENES: {e}")
-                res_img_texto = []
+                continue
+                
+        resultados_rankeados.sort(key=lambda x: x["similitud_semantica"], reverse=True)
+        if resultados_rankeados:
+            top3 = [(r["nombre_archivo"], round(r["similitud_semantica"], 3)) for r in resultados_rankeados[:3]]
+            print(f"   📊 Re-ranking top-3 sim: {top3}")
+        # Umbral reducido a 0.30: los embeddings de texto 384d tienen similitudes
+        # cross-modal (query→caption) naturalmente más bajas que en indexación directa.
+        # Tomamos los top_k mejores siempre que superen 0.30, garantizando al menos 1
+        # resultado si alguno supera ese umbral mínimo.
+        filtrados = [r for r in resultados_rankeados if r["similitud_semantica"] >= 0.30]
+        if not filtrados and resultados_rankeados:
+            # Fallback: si ninguno supera 0.30, devolvemos el mejor candidato si supera 0.20
+            mejor = resultados_rankeados[0]
+            if mejor["similitud_semantica"] >= 0.20:
+                print(f"   ⚡ Fallback: mejor candidato sim={mejor['similitud_semantica']:.3f}")
+                filtrados = [mejor]
+        return filtrados[:top_k]
 
-        # 5. Entidades (filtro por payload)
+    async def busqueda_hibrida(self, texto_embedding, imagen_embedding_uni, imagen_embedding_plip, entidades, top_k=10):
+        res_texto = []
+        res_uni = []
+        res_plip = []
+        res_ent = []
+        res_pag_chunks = []
+        res_vec = []
+        res_img_texto = []
+        res_keyword = []  # búsqueda de texto por keywords (fallback)
+        
+        if texto_embedding:
+            res_texto = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k)
+        if imagen_embedding_uni:
+            res_uni = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
+            res_uni = [r for r in res_uni if r.get("similitud", 0) >= 0.80]
+        if imagen_embedding_plip:
+            res_plip = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
+            res_plip = [r for r in res_plip if r.get("similitud", 0) >= 0.80]
+            
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
+        
+        tiene_imagen = imagen_embedding_uni is not None or imagen_embedding_plip is not None
+        if tiene_imagen:
+            top_img_results = [r for r in (res_uni + res_plip) if r.get("similitud", 0) > 0.75]
+            for img_r in top_img_results[:3]:
+                fuente = img_r.get("fuente", "")
+                pagina = img_r.get("pagina")
+                if fuente and pagina:
+                    chunks_pag = await self.busqueda_chunks_por_pagina(fuente, pagina)
+                    res_pag_chunks.extend(chunks_pag)
 
-        # 6. Chunks co-ubicados con imágenes (misma página)
-        paginas_encontradas = set()
-        for r in res_uni + res_plip + res_img_texto:
-            if r.get("tipo") == "imagen" and r.get("pagina") and r.get("fuente"):
-                paginas_encontradas.add((r["fuente"], r["pagina"]))
-        for fuente, pagina in list(paginas_encontradas)[:5]:
-            chunks_pagina = await self.busqueda_por_pagina(fuente, pagina)
-            res_pag.extend(chunks_pagina)
-        if res_pag:
-            print(f"   📄 Co-ubicados: {len(res_pag)} chunks de {len(paginas_encontradas)} páginas")
+        if texto_embedding:
+            try:
+                raw_img = self.client.query_points(collection_name=COLLECTION_IMAGENES, query=texto_embedding, using="texto_emb", limit=top_k).points
+                for r in raw_img:
+                    nombre_archivo = r.payload.get("nombre_archivo", "").lower()
+                    if "_full." in nombre_archivo:
+                        continue
+                    caption = r.payload.get("caption", "")
+                    texto_pag = r.payload.get("texto_pagina", "")
+                    ocr = r.payload.get("ocr_text", "")
+                    texto = caption if caption else (texto_pag if texto_pag else ocr)
+                    if r.score > 0.1:
+                        res_img_texto.append({
+                            "id": str(r.id), "texto": texto, "fuente": r.payload.get("fuente", ""),
+                            "tipo": "imagen", "imagen_path": r.payload.get("path"), "similitud": r.score,
+                            "nombre_archivo": r.payload.get("nombre_archivo", ""),
+                            "etiqueta": r.payload.get("etiqueta", ""),
+                            "pagina": r.payload.get("pagina")
+                        })
+            except Exception: pass
 
-        # 7. Vecindad sobre los mejores
-        todos = res_texto + res_uni + res_plip + res_img_texto
-        if todos:
-            res_vec = await self.expandir_vecindad(todos[:6])
+        # Fallback: búsqueda por keywords en el texto de los chunks
+        # Si la búsqueda vectorial no da buenos resultados, buscamos por texto
+        consulta_palabras = entidades.get("_consulta", [])
+        tejidos = entidades.get("tejidos", [])
+        estructuras = entidades.get("estructuras", [])
+        terminos_keyword = tejidos + estructuras + consulta_palabras
+        if not tiene_imagen and terminos_keyword:
+            # Solo hacer fallback en modo texto cuando los resultados vectoriales son débiles
+            top_vector_sim = max((r.get("similitud", 0) for r in res_texto), default=0)
+            if top_vector_sim < 0.50:
+                res_keyword = await self.busqueda_chunks_por_texto(terminos_keyword, top_k)
 
-        combined: Dict[str, Dict] = {}
-
-        def agregar(resultados: List[Dict], peso: float):
+        combined = {}
+        def agregar(resultados, peso, es_visual=False):
             for r in resultados:
                 key = r.get("id") or f"{r.get('fuente')}_{str(r.get('texto',''))[:40]}"
-                if not r.get("texto") and not r.get("imagen_path"):
-                    continue
-                sim_ponderada = r.get("similitud", 0) * peso
+                if not r.get("texto") and not r.get("imagen_path"): continue
+                sim = r.get("similitud", 0)
+                sim_ponderada = sim * peso
+                if es_visual and sim > 0.95:
+                    sim_ponderada += 2.0
                 if key not in combined:
                     combined[key] = {**r, "similitud": sim_ponderada}
                 else:
                     combined[key]["similitud"] += sim_ponderada
-                    # Preservar texto_pagina si el nuevo resultado lo tiene y el anterior no
-                    if r.get("texto_pagina") and not combined[key].get("texto_pagina"):
-                        combined[key]["texto_pagina"] = r["texto_pagina"]
-                    if r.get("imagenes_pagina") and not combined[key].get("imagenes_pagina"):
-                        combined[key]["imagenes_pagina"] = r["imagenes_pagina"]
 
-        agregar(res_texto,     0.40)
-        agregar(res_uni,       0.20)
-        agregar(res_plip,      0.20)
-        agregar(res_img_texto, 0.30)  # NUEVO: texto→imagen
-        agregar(res_ent,       0.35)
-        agregar(res_pag,       0.30)
-        agregar(res_vec,       0.10)
+        if tiene_imagen:
+            # Prioridad 1: lo que el usuario está escribiendo explícitamente en el chat
+            agregar(res_texto, 0.80)
+            
+            # Prioridad 2: los matches visuales (en caso de que la consulta sea sobre la imagen)
+            agregar(res_uni, 0.60, es_visual=True)
+            agregar(res_plip, 0.60, es_visual=True)
+            agregar(res_ent, 0.50)
+            
+            # Fallback contextual: los textos de la página de la imagen (solo útiles si no hay un buen match en res_texto)
+            agregar(res_pag_chunks, 0.40)
+        else:
+            agregar(res_texto, 0.80)
+            agregar(res_uni, 0.20, es_visual=True)
+            agregar(res_plip, 0.20, es_visual=True)
+            agregar(res_img_texto, 0.40)
+            agregar(res_ent, 0.60)
+            agregar(res_keyword, 0.70)  # keyword matches son confiables
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
-        print(f"   📊 Híbrida: Txt={len(res_texto)} | UNI={len(res_uni)} | "
-              f"PLIP={len(res_plip)} | ImgTxt={len(res_img_texto)} | "
-              f"Ent={len(res_ent)} | Pag={len(res_pag)} | Vec={len(res_vec)} "
-              f"-> {len(final)}")
+        print(f"   📊 Híbrida: Txt={len(res_texto)} | "
+              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
+              f"ImgTxt={len(res_img_texto)} | Keyword={len(res_keyword)} -> {len(final)}")
 
         return final[:15]
-
-    # ------------------------------------------------------------------
-    # Utilidades
-    # ------------------------------------------------------------------
-
-    async def contar_chunks(self) -> int:
-        try:
-            return self.client.get_collection(COLLECTION_CHUNKS).points_count
-        except Exception:
-            return 0
-
-    async def contar_imagenes(self) -> int:
-        try:
-            return self.client.get_collection(COLLECTION_IMAGENES).points_count
-        except Exception:
-            return 0
-
 
 # =============================================================================
 # MEMORIA SEMÁNTICA CON PERSISTENCIA DE IMAGEN
 # =============================================================================
 
 class SemanticMemory:
+    """
+    Mantiene historial de conversación y la última imagen activa.
+    La imagen persiste entre turnos hasta que el usuario la cambie
+    explícitamente con el comando 'nueva imagen'.
+    Añade persistencia en Qdrant con vectores texto, UNI y PLIP.
+    """
+
     def __init__(self, llm, embeddings=None, uni=None, plip=None, max_entries: int = 10):
         self.llm            = llm
         self.embeddings     = embeddings
@@ -792,33 +944,51 @@ class SemanticMemory:
         self.summary        = ""
         self.direct_history = ""
 
+        # Persistencia de imagen entre turnos
         self.imagen_activa_path: Optional[str] = None
         self.imagen_turno_subida: int = 0
+        self.analisis_visual_activo: Optional[str] = None
         self.turno_actual: int = 0
-
+        
+        # Qdrant init
         self.collection_name = "memoria_histo"
         self.qdrant = QdrantClient(path="./qdrant_memoria")
-
+        
+        # --- Validación de Colección Qdrant (Dimensionalidad) ---
         try:
-            self.qdrant.get_collection(self.collection_name)
+            info = self.qdrant.get_collection(self.collection_name)
+            config = info.config.params.vectors
+            
+            # Verificar dimensión de 'texto'
+            dims_actual = 0
+            if isinstance(config, dict) and "texto" in config:
+                dims_actual = config["texto"].size
+            
+            if dims_actual != DIM_TEXTO:
+                print(f"   ⚠️ Dimensión de Qdrant incorrecta ({dims_actual} != {DIM_TEXTO}). Recreando...")
+                self.qdrant.delete_collection(self.collection_name)
+                raise Exception("Mismatch forcing recreation")
         except Exception:
-            print(f"   🗂️ Creando colección Qdrant '{self.collection_name}' para memoria semántica...")
+            print(f"   🗂️ Configurando colección Qdrant '{self.collection_name}'...")
             self.qdrant.create_collection(
                 collection_name=self.collection_name,
                 vectors_config={
-                    "texto": VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
-                    "uni":   VectorParams(size=DIM_IMG_UNI,      distance=Distance.COSINE),
-                    "plip":  VectorParams(size=DIM_IMG_PLIP,     distance=Distance.COSINE),
+                    "texto": VectorParams(size=DIM_TEXTO, distance=Distance.COSINE),
+                    "uni": VectorParams(size=DIM_IMG_UNI, distance=Distance.COSINE),
+                    "plip": VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
                 }
             )
 
-    def set_imagen(self, path: Optional[str]):
+    def set_imagen(self, path: Optional[str], analisis_visual: Optional[str] = None):
+        """Registra una nueva imagen activa. None = limpiar."""
         if path and os.path.exists(path):
             self.imagen_activa_path  = path
             self.imagen_turno_subida = self.turno_actual
+            self.analisis_visual_activo = analisis_visual
             print(f"   📌 Imagen activa registrada (turno {self.turno_actual}): {path}")
         elif path is None:
             self.imagen_activa_path = None
+            self.analisis_visual_activo = None
             print("   🗑️  Imagen activa limpiada")
 
     def get_imagen_activa(self) -> Optional[str]:
@@ -830,10 +1000,13 @@ class SemanticMemory:
         return self.get_imagen_activa() is not None
 
     def add_interaction(self, query: str, response: str):
+        """Guarda siempre la interacción, independientemente del resultado RAG."""
         self.turno_actual += 1
         self.conversations.append({
-            "query": query, "response": response,
-            "turno": self.turno_actual, "imagen": self.imagen_activa_path
+            "query":    query,
+            "response": response,
+            "turno":    self.turno_actual,
+            "imagen":   self.imagen_activa_path
         })
         if len(self.conversations) > self.max_entries:
             self.conversations.pop(0)
@@ -850,38 +1023,52 @@ class SemanticMemory:
                     f"Asistente: {conv['response']}\n"
                 )
         self._update_summary()
-
+        
+        # Guardar en Qdrant cada 5 interacciones
         if self.turno_actual % 5 == 0 and len(self.conversations) > 0 and self.embeddings:
             self._guardar_memoria_qdrant()
 
     def _guardar_memoria_qdrant(self):
         print("   🧠 Generando resumen profundo para guardar en memoria (Qdrant)...")
         try:
+            # Resumir contexto reciente
             resp = invoke_con_reintento_sync(self.llm, [
                 SystemMessage(content="Genera un resumen detallado y técnico del siguiente historial de conversación sobre histología, destacando las entidades mencionadas y las conclusiones."),
                 HumanMessage(content=self.direct_history)
             ])
             resumen = resp.content
+            
+            # Embeddings del resumen textual
             emb_texto = embed_query_con_reintento(self.embeddings, resumen)
-            emb_uni  = [0.0] * DIM_IMG_UNI
+            
+            # Embeddings visuales de la imagen activa en este bloque (si la hay)
+            emb_uni = [0.0] * DIM_IMG_UNI
             emb_plip = [0.0] * DIM_IMG_PLIP
             if self.imagen_activa_path and os.path.exists(self.imagen_activa_path):
                 if self.uni:
-                    emb_uni = self.uni.embed_image(self.imagen_activa_path).tolist()
+                    # Memory images: apply preprocessing for consistency
+                    emb_uni = self.uni.embed_image(self.imagen_activa_path, preprocess=True).tolist()
                 if self.plip:
-                    emb_plip = self.plip.embed_image(self.imagen_activa_path).tolist()
+                    emb_plip = self.plip.embed_image(self.imagen_activa_path, preprocess=True).tolist()
 
             point = PointStruct(
                 id=str(uuid.uuid4()),
-                vector={"texto": emb_texto, "uni": emb_uni, "plip": emb_plip},
+                vector={
+                    "texto": emb_texto,
+                    "uni": emb_uni,
+                    "plip": emb_plip
+                },
                 payload={
-                    "resumen":      resumen,
-                    "turno_fin":    self.turno_actual,
+                    "resumen": resumen,
+                    "turno_fin": self.turno_actual,
                     "tiene_imagen": self.imagen_activa_path is not None,
-                    "imagen_path":  self.imagen_activa_path
+                    "imagen_path": self.imagen_activa_path
                 }
             )
-            self.qdrant.upsert(collection_name=self.collection_name, points=[point])
+            self.qdrant.upsert(
+                collection_name=self.collection_name,
+                points=[point]
+            )
             print("   ✅ Resumen guardado en Qdrant (memoria_histo)")
         except Exception as e:
             print(f"   ⚠️ Error guardando memoria en Qdrant: {e}")
@@ -901,51 +1088,106 @@ class SemanticMemory:
 
     def get_context(self, query: str = "") -> str:
         ctx = self.summary.strip() or "No hay consultas previas."
+        
+        # Recuperar de Qdrant
         if query and self.embeddings:
             try:
                 emb_query = embed_query_con_reintento(self.embeddings, query)
                 resultados = self.qdrant.query_points(
                     collection_name=self.collection_name,
-                    query=emb_query, using="texto", limit=2
+                    query=emb_query,
+                    using="texto",
+                    limit=2
                 ).points
-                memorias = [r.payload['resumen'] for r in resultados if r.score > 0.4]
-                if memorias:
-                    ctx += "\n\n[Memorias históricas recuperadas:]\n" + "\n- ".join(memorias)
+                
+                memorias_recuperadas = [r.payload['resumen'] for r in resultados if r.score > 0.4]
+                if memorias_recuperadas:
+                    ctx += "\n\n[Memorias históricas recuperadas:]\n" + "\n- ".join(memorias_recuperadas)
             except Exception as e:
                 print(f"   ⚠️ Error recuperando memoria Qdrant: {e}")
+
         if self.imagen_activa_path:
             ctx += (f"\n\n[Imagen activa en el chat: "
                     f"{os.path.basename(self.imagen_activa_path)}]")
         return ctx
 
+    def get_history_for_prompt(self, max_turns: int = 5) -> str:
+        """Retorna los últimos max_turns intercambios formateados para inyectar en el system prompt."""
+        recent = self.conversations[-max_turns:]
+        if not recent:
+            return ""
+        lines = []
+        for conv in recent:
+            lines.append(f"Usuario: {conv['query']}")
+            resp = conv['response']
+            resp_truncada = resp[:200] + "..." if len(resp) > 200 else resp
+            lines.append(f"Asistente: {resp_truncada}")
+        return "\n".join(lines)
+
 
 # =============================================================================
-# CLASIFICADOR SEMÁNTICO
+# CLASIFICADOR SEMÁNTICO — reemplaza verificación por keywords
 # =============================================================================
 
 class ClasificadorSemantico:
-    UMBRAL_SIMILITUD = 0.18
-    UMBRAL_LLM       = 0.5
+    """
+    Determina si una consulta pertenece al dominio histológico combinando:
+      1. Similitud coseno contra la ontología extraída del contenido (temario).
+         Fallback a anclas semánticas hardcodeadas si el temario está vacío.
+      2. Razonamiento LLM con contexto de imagen disponible.
+    """
+
+    UMBRAL_SIMILITUD = 0.45
+    UMBRAL_LLM       = 0.49
 
     def __init__(self, llm, embeddings, device: str, temario: List[str]):
         self.llm        = llm
         self.embeddings = embeddings
         self.device     = device
-        self.temario    = temario
+        self._temario: List[str]              = temario
         self._anclas_emb: Optional[np.ndarray] = None
+        self._temario_emb: Optional[np.ndarray] = None
+
+    @property
+    def temario(self) -> List[str]:
+        return self._temario
+
+    @temario.setter
+    def temario(self, value: List[str]):
+        self._temario = value
+        self._temario_emb = None  # Invalidar cache al actualizar ontología
+        print(f"   🔄 Ontología actualizada ({len(value)} temas) — cache de embeddings invalidado")
 
     def _embed_textos(self, textos: List[str]) -> np.ndarray:
         return np.array(embed_documents_con_reintento(self.embeddings, textos))
 
     def _get_anclas_emb(self) -> np.ndarray:
+        """Embeddings de anclas hardcodeadas (fallback cuando no hay temario)."""
         if self._anclas_emb is None:
-            print("   🔄 Precalculando embeddings de anclas semánticas (Gemini)...")
+            print("   🔄 Precalculando embeddings de anclas semánticas (fallback)...")
             self._anclas_emb = self._embed_textos(ANCLAS_SEMANTICAS_HISTOLOGIA)
         return self._anclas_emb
+
+    def _get_temario_emb(self) -> Optional[np.ndarray]:
+        """Embeddings de la ontología real extraída del contenido."""
+        if not self._temario:
+            return None
+        if self._temario_emb is None:
+            print(f"   🔄 Precalculando embeddings de ontología ({len(self._temario)} temas)...")
+            self._temario_emb = self._embed_textos(self._temario)
+        return self._temario_emb
 
     def similitud_con_dominio(self, consulta: str) -> float:
         try:
             q_emb = np.array(embed_query_con_reintento(self.embeddings, consulta))
+
+            # Priorizar ontología extraída del contenido real
+            temario_emb = self._get_temario_emb()
+            if temario_emb is not None and len(temario_emb) > 0:
+                sims = (q_emb @ temario_emb.T).flatten()
+                return float(np.max(sims))
+
+            # Fallback a anclas hardcodeadas (solo antes de indexar)
             a_emb = self._get_anclas_emb()
             sims  = (q_emb @ a_emb.T).flatten()
             return float(np.max(sims))
@@ -953,20 +1195,32 @@ class ClasificadorSemantico:
             print(f"   ⚠️ Error similitud semántica: {e}")
             return 0.0
 
-    async def clasificar(self, consulta: str, analisis_visual: Optional[str] = None,
-                          imagen_activa: bool = False,
-                          temario_muestra: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def clasificar(
+        self,
+        consulta: str,
+        analisis_visual: Optional[str] = None,
+        imagen_activa: bool = False,
+        temario_muestra: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        # Paso 1: Similitud ImageBind
         sim = self.similitud_con_dominio(consulta)
         print(f"   📐 Similitud semántica con dominio histológico: {sim:.4f}")
+
         umbral_efectivo = self.UMBRAL_SIMILITUD * (0.6 if imagen_activa else 1.0)
 
         if sim >= umbral_efectivo:
-            return {"valido": True, "tema_encontrado": None,
-                    "motivo": f"Similitud {sim:.3f} ≥ umbral {umbral_efectivo:.3f}",
-                    "similitud_dominio": sim, "metodo": "semantico_imagebind"}
+            return {
+                "valido":            True,
+                "tema_encontrado":   None,
+                "motivo":            f"Similitud ImageBind {sim:.3f} ≥ umbral {umbral_efectivo:.3f}",
+                "similitud_dominio": sim,
+                "metodo":            "semantico_imagebind"
+            }
 
+        # Paso 2: LLM como árbitro
         muestra_temas = (temario_muestra or self.temario)[:60]
         temario_txt   = "\n".join(f"- {t}" for t in muestra_temas)
+
         context_extra = ""
         if analisis_visual:
             context_extra = f"\n\nANÁLISIS DE IMAGEN DISPONIBLE:\n{analisis_visual[:600]}"
@@ -998,205 +1252,379 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
             ])
             texto     = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
             data      = json.loads(texto)
-            confianza = float(data.get("confianza", 0.5))
+            confianza = float(data.get("confianza", 0.49))
             valido    = bool(data.get("valido", True))
-            if not valido and imagen_activa and confianza < 0.7:
+
+            if not valido and imagen_activa:
                 valido = True
                 data["motivo"] += " [aceptado por imagen activa]"
-            return {"valido": valido, "tema_encontrado": data.get("tema_encontrado"),
-                    "motivo": data.get("motivo", ""), "similitud_dominio": sim,
-                    "metodo": "llm" if sim < umbral_efectivo * 0.5 else "combinado"}
+
+            return {
+                "valido":            valido,
+                "tema_encontrado":   data.get("tema_encontrado"),
+                "motivo":            data.get("motivo", ""),
+                "similitud_dominio": sim,
+                "metodo":            "llm" if sim < umbral_efectivo * 0.49 else "combinado"
+            }
         except Exception as e:
             print(f"   ⚠️ Error clasificador LLM: {e}")
-            return {"valido": imagen_activa or sim > 0.10, "tema_encontrado": None,
-                    "motivo": f"Fallback: {e}", "similitud_dominio": sim, "metodo": "fallback"}
+            return {
+                "valido":            imagen_activa or sim > 0.10,
+                "tema_encontrado":   None,
+                "motivo":            f"Fallback: {e}",
+                "similitud_dominio": sim,
+                "metodo":            "fallback"
+            }
 
 
 # =============================================================================
 # EXTRACTOR DE IMÁGENES DE PDF
 # =============================================================================
 
-class ExtractorImagenesPDF:
-    RENDER_DPI = 200
-    MIN_IMAGE_SIZE = 150
-    MAX_IMAGE_SIZE = (1280, 1280)
+class ImageExtractionConfig:
+    """Configuration for image extraction and preprocessing."""
+    
+    # Size thresholds
+    MIN_WIDTH: int = 150
+    MIN_HEIGHT: int = 150
+    TARGET_MAGNIFICATION_SIZE: int = 868
+    
+    # Enhancement settings
+    ENHANCE_CONTRAST: bool = True
+    ENHANCE_BRIGHTNESS: bool = True
+    CONTRAST_FACTOR: float = 1.2
+    BRIGHTNESS_FACTOR: float = 1.1
+    
+    # Fallback settings
+    FALLBACK_DPI: int = 150
+    
+    # Resampling
+    RESAMPLING_ALGORITHM = Image.Resampling.LANCZOS
 
-    def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES):
+
+class ExtractorImagenesPDF:
+    def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES, config: Optional[ImageExtractionConfig] = None):
         self.directorio_salida = directorio_salida
+        self.config = config if config is not None else ImageExtractionConfig()
         os.makedirs(directorio_salida, exist_ok=True)
 
-    def extraer_de_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
-        imagenes = []
-        nombre_pdf = os.path.splitext(os.path.basename(pdf_path))[0]
+    def _apply_preprocessing(self, image: Image.Image) -> Image.Image:
+        """
+        Apply preprocessing enhancements to image.
+        
+        Applies contrast enhancement followed by brightness enhancement
+        based on configuration settings.
+        
+        Args:
+            image: PIL Image object
+            
+        Returns:
+            Enhanced PIL Image object, or original if preprocessing fails
+        """
+        try:
+            from PIL import ImageEnhance
+            
+            enhanced = image
+            
+            # Apply contrast enhancement first
+            if self.config.ENHANCE_CONTRAST:
+                enhancer = ImageEnhance.Contrast(enhanced)
+                enhanced = enhancer.enhance(self.config.CONTRAST_FACTOR)
+                
+            # Apply brightness enhancement second
+            if self.config.ENHANCE_BRIGHTNESS:
+                enhancer = ImageEnhance.Brightness(enhanced)
+                enhanced = enhancer.enhance(self.config.BRIGHTNESS_FACTOR)
+                
+            return enhanced
+            
+        except Exception as e:
+            print(f"  ⚠️ Preprocessing failed: {e}, using original image")
+            return image
 
+    def _apply_magnification(self, image: Image.Image) -> Image.Image:
+        """
+        Magnify image to target size if below threshold.
+        
+        Magnification rules:
+        - If width < 868: scale to width=868, preserve aspect ratio
+        - Else if height < 868: scale to height=868, preserve aspect ratio
+        - Else: no magnification needed
+        
+        Args:
+            image: PIL Image object
+            
+        Returns:
+            Magnified PIL Image object (or original if no magnification needed)
+        """
+        w, h = image.size
+        target = self.config.TARGET_MAGNIFICATION_SIZE
+        
+        # Check if magnification is needed
+        if w >= target and h >= target:
+            return image
+            
+        # Calculate new dimensions
+        if w < target:
+            # Scale based on width
+            new_w = target
+            new_h = int(h * (target / w))
+            print(f"  🔍 Magnifying: {w}x{h} → {new_w}x{new_h} (width-based)")
+        else:
+            # Scale based on height (w >= target but h < target)
+            new_h = target
+            new_w = int(w * (target / h))
+            print(f"  🔍 Magnifying: {w}x{h} → {new_w}x{new_h} (height-based)")
+            
+        # Apply magnification with LANCZOS resampling
+        return image.resize((new_w, new_h), self.config.RESAMPLING_ALGORITHM)
+
+    def _fallback_render_page(self, pdf_path: str, page_num: int) -> Optional[Image.Image]:
+        """
+        Render PDF page as image using pdf2image fallback.
+        
+        Args:
+            pdf_path: Path to PDF file
+            page_num: Page number (1-indexed)
+            
+        Returns:
+            PIL Image object or None if rendering fails
+        """
+        try:
+            from pdf2image import convert_from_path
+            
+            print(f"  🔄 Fallback: rendering page {page_num} with pdf2image")
+            
+            pag_imgs = convert_from_path(
+                pdf_path,
+                first_page=page_num,
+                last_page=page_num,
+                dpi=self.config.FALLBACK_DPI
+            )
+            
+            if pag_imgs:
+                return pag_imgs[0]
+            return None
+            
+        except Exception as e:
+            print(f"  ❌ Fallback rendering failed for page {page_num}: {e}")
+            return None
+
+    @staticmethod
+    def _extraer_etiqueta_imagen(texto: str) -> str:
+        """Busca la etiqueta formal de la imagen (Imagen X.X, Fig X.X, Figura X.X)
+        en el texto y la devuelve. Devuelve cadena vacía si no encuentra."""
+        if not texto:
+            return ""
+        patrones = [
+            r'(Imagen\s+\d+[\.]?\d*[A-Za-z]?)',
+            r'(Fig(?:ura)?\.?\s*\d+[\.]?\d*[A-Za-z]?)',
+            r'(Lámina\s+\d+[\.]?\d*[A-Za-z]?)',
+            r'(Foto(?:grafía)?\s+\d+[\.]?\d*[A-Za-z]?)',
+        ]
+        for patron in patrones:
+            match = re.search(patron, texto, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def extraer_caption_imagen(page_fitz, img_bbox, texto_pagina_completo: str) -> str:
+        """Extrae la etiqueta 'Imagen X.X' / 'Fig X.X' + TODO el texto debajo
+        de la imagen hasta el final de la página.
+        
+        Estrategia:
+        1. Buscar texto desde ligeramente ARRIBA del borde inferior de la imagen
+           (para capturar etiquetas que se solapan con el bbox) hasta el final.
+        2. Si no se encontró etiqueta, buscar desde justo debajo.
+        3. Siempre devolver el caption completo (etiqueta + descripción).
+        """
+        caption = ""
+        try:
+            page_rect = page_fitz.rect
+            
+            # Paso 1: Buscar con margen hacia arriba (10px) para capturar
+            # etiquetas que solapan con el borde inferior de la imagen
+            margen_overlap = 10  # pixels de margen
+            area_expandida = fitz.Rect(
+                0,
+                max(0, img_bbox[3] - margen_overlap),
+                page_rect.width,
+                page_rect.height
+            )
+            texto_expandido = page_fitz.get_text("text", clip=area_expandida).strip()
+            
+            if texto_expandido:
+                caption = texto_expandido
+            else:
+                # Paso 2: Buscar desde justo debajo sin margen
+                area_abajo = fitz.Rect(
+                    0,
+                    img_bbox[3],
+                    page_rect.width,
+                    page_rect.height
+                )
+                caption = page_fitz.get_text("text", clip=area_abajo).strip()
+        except Exception:
+            pass
+        
+        if caption:
+            # Limpiar: remover números de página sueltos al final
+            caption = re.sub(r'\n\s*\d{1,3}\s*$', '', caption).strip()
+            return caption
+        # Fallback: primeros 500 chars del texto de la página
+        return texto_pagina_completo[:500] if texto_pagina_completo else ""
+
+    def extraer_de_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
+        imagenes_extraidas = []
+        nombre_pdf = os.path.splitext(os.path.basename(pdf_path))[0]
         try:
             doc = fitz.open(pdf_path)
-            image_count = 0
-            seen_xrefs  = set()
-            seen_hashes = set()
-
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                valid_images_this_page = []
-                img_info_list = page.get_image_info(xrefs=True)
-                page_xrefs    = list(dict.fromkeys(
-                    [info["xref"] for info in img_info_list if info.get("xref")]
-                ))
-
-                if page_xrefs:
-                    for xref in page_xrefs:
-                        if xref in seen_xrefs:
-                            continue
-                        seen_xrefs.add(xref)
-                        try:
-                            base_image  = doc.extract_image(xref)
-                            if not base_image:
-                                continue
-                            image_bytes = base_image["image"]
-                            ext         = base_image["ext"]
-
-                            import hashlib
-                            img_hash = hashlib.md5(image_bytes).hexdigest()
-                            if img_hash in seen_hashes:
-                                continue
-                            seen_hashes.add(img_hash)
-
-                            image_count += 1
-                            img_path = os.path.join(
-                                self.directorio_salida,
-                                f"{nombre_pdf}_p{page_num+1}_img{image_count}.{ext}"
-                            )
-                            with open(img_path, "wb") as f:
-                                f.write(image_bytes)
-
-                            img_pil       = Image.open(img_path)
-                            width, height = img_pil.size
-                            area          = width * height
-
-                            if width >= self.MIN_IMAGE_SIZE and height >= self.MIN_IMAGE_SIZE:
-                                if img_pil.mode != "RGB":
-                                    img_pil = img_pil.convert("RGB")
-                                img_path_rgb = os.path.join(
-                                    self.directorio_salida,
-                                    f"{nombre_pdf}_p{page_num+1}_img{image_count}.jpg"
-                                )
-                                img_pil.save(img_path_rgb, "JPEG")
-                                if img_path != img_path_rgb:
-                                    try:
-                                        os.remove(img_path)
-                                    except OSError:
-                                        pass
-                                img_path = img_path_rgb
-
-                                try:
-                                    texto_pagina = page.get_text("text").strip()
-                                    texto_pagina = re.sub(r'\s+', ' ', texto_pagina)
-                                    ocr_img  = pytesseract.image_to_string(img_pil).strip()[:300]
-                                    ocr_text = f"[OCR: {ocr_img}] [Página: {texto_pagina}]"[:1500]
-                                except Exception:
-                                    ocr_text = ""
-
-                                valid_images_this_page.append({
-                                    "path": img_path,
-                                    "fuente_pdf": os.path.basename(pdf_path),
-                                    "pagina": page_num + 1,
-                                    "indice": image_count,
-                                    "ocr_text": ocr_text,
-                                    "area": area,
-                                })
-                            else:
-                                try:
-                                    os.remove(img_path)
-                                except OSError:
-                                    pass
-                        except Exception as e:
-                            print(f"  ⚠️ Error xref {xref} pág {page_num+1}: {e}")
-                else:
-                    try:
-                        page_imgs = convert_from_path(
-                            pdf_path, first_page=page_num+1, last_page=page_num+1,
-                            dpi=self.RENDER_DPI, fmt='jpeg', size=self.MAX_IMAGE_SIZE
-                        )
-                        if page_imgs:
-                            image_count += 1
-                            img_path = os.path.join(
-                                self.directorio_salida,
-                                f"{nombre_pdf}_p{page_num+1}_img{image_count}.jpg"
-                            )
-                            page_imgs[0].save(img_path, "JPEG")
-                            width, height = page_imgs[0].size
-                            try:
-                                texto_pagina = page.get_text("text").strip()
-                                texto_pagina = re.sub(r'\s+', ' ', texto_pagina)
-                                ocr_img  = pytesseract.image_to_string(page_imgs[0]).strip()[:300]
-                                ocr_text = f"[OCR: {ocr_img}] [Página: {texto_pagina}]"[:1500]
-                            except Exception:
-                                ocr_text = ""
-                            valid_images_this_page.append({
-                                "path": img_path,
-                                "fuente_pdf": os.path.basename(pdf_path),
-                                "pagina": page_num + 1,
-                                "indice": image_count,
-                                "ocr_text": ocr_text,
-                                "area": width * height,
-                            })
-                    except Exception as e:
-                        print(f"  ⚠️ Error renderizando pág {page_num+1}: {e}")
-
-                if valid_images_this_page:
-                    largest = max(valid_images_this_page, key=lambda x: x["area"])
-                    for img_data in valid_images_this_page:
-                        if img_data["path"] != largest["path"]:
-                            try:
-                                os.remove(img_data["path"])
-                            except OSError:
-                                pass
-                    largest.pop("area", None)
-                    imagenes.append(largest)
-
-            doc.close()
-
-            if imagenes:
-                print(f"  📸 {len(imagenes)} figuras extraídas de {os.path.basename(pdf_path)} (PyMuPDF)")
-                return imagenes
-
-            print(f"  ⚠️ Sin figuras vía PyMuPDF, usando fallback de página completa...")
-
         except Exception as e:
-            print(f"  ⚠️ Error PyMuPDF ({e}), usando fallback de página completa...")
-
-        try:
-            paginas = convert_from_path(pdf_path, dpi=self.RENDER_DPI)
-        except Exception as e:
-            print(f"  ❌ Error renderizando {pdf_path}: {e}")
+            print(f"❌ Error abriendo {pdf_path}: {e}")
             return []
 
-        for num_pagina, pil_img in enumerate(paginas, start=1):
-            nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.jpg"
-            ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+        def _texto_pagina_con_contexto(doc, idx_0based: int) -> str:
+            """Devuelve texto SOLO de la página actual.
+            El caption se extrae por proximidad espacial (bbox),
+            no por concatenación de páginas adyacentes."""
             try:
-                pil_img.save(ruta_completa, format="JPEG")
-                try:
-                    ocr_text = pytesseract.image_to_string(pil_img).strip()[:300]
-                except Exception:
-                    ocr_text = ""
-                imagenes.append({
-                    "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
-                    "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text
-                })
-            except Exception as e:
-                print(f"  ⚠️ Error pág {num_pagina}: {e}")
+                return doc[idx_0based].get_text().strip()
+            except Exception:
+                return ""
 
-        print(f"  📸 {len(imagenes)} páginas de {os.path.basename(pdf_path)} (fallback)")
-        return imagenes
+        for num_pagina, pagina in enumerate(doc, start=1):
+            idx_0 = num_pagina - 1  # índice base-0 para acceder a doc[idx]
+            valid_images_this_page = []
+            
+            # Método preciso: solo imágenes realmente dibujadas en esta página
+            try:
+                img_info_list = pagina.get_image_info(xrefs=True)
+                # Mapear xref -> bbox para extracción de caption (Fix #1)
+                xref_to_bbox = {info["xref"]: info.get("bbox") for info in img_info_list if info.get("xref")}
+                page_xrefs = list(xref_to_bbox.keys())
+                
+                if page_xrefs:
+                    for xref in page_xrefs:
+                        try:
+                            base_image = doc.extract_image(xref)
+                            if not base_image: continue
+                            
+                            image_bytes = base_image["image"]
+                            from io import BytesIO
+                            pil_temp = Image.open(BytesIO(image_bytes))
+                            w, h = pil_temp.size
+                            
+                            if w >= self.config.MIN_WIDTH and h >= self.config.MIN_HEIGHT:
+                                valid_images_this_page.append({
+                                    "pil": pil_temp,
+                                    "area": w * h,
+                                    "bbox": xref_to_bbox.get(xref)
+                                })
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            
+            if valid_images_this_page:
+                # Seleccionar la imagen más grande (histológica)
+                mejor = max(valid_images_this_page, key=lambda x: x["area"])
+                pil_img = mejor["pil"]
+                img_bbox = mejor.get("bbox")
+                
+                # Apply preprocessing pipeline
+                pil_img = self._apply_preprocessing(pil_img)
+                
+                # Apply magnification logic
+                pil_img = self._apply_magnification(pil_img)
+                
+                nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.png"
+                ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+                
+                try:
+                    pil_img.save(ruta_completa, format="PNG")
+                    try:
+                        ocr_text = pytesseract.image_to_string(pil_img).strip()[:300]
+                    except Exception:
+                        ocr_text = ""
+                    
+                    texto_completo_pagina = _texto_pagina_con_contexto(doc, idx_0)
+                    # Extraer caption por proximidad espacial (Fix #1)
+                    caption = ""
+                    if img_bbox:
+                        caption = self.extraer_caption_imagen(pagina, img_bbox, texto_completo_pagina)
+
+                    # Extraer etiqueta formal ("Imagen 15.5", "Fig 3A")
+                    etiqueta = self._extraer_etiqueta_imagen(caption)
+                    if not etiqueta:
+                        etiqueta = self._extraer_etiqueta_imagen(texto_completo_pagina)
+
+                    imagenes_extraidas.append({
+                        "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
+                        "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
+                        "texto_pagina": texto_completo_pagina,
+                        "caption": caption,
+                        "nombre_archivo": nombre_archivo,
+                        "etiqueta": etiqueta
+                    })
+                except Exception as e:
+                    print(f"  ⚠️ Error guardando pág {num_pagina}: {e}")
+            else:
+                # FALLBACK: No hay imágenes o son muy chicas -> Renderizar página completa
+                pil_full = self._fallback_render_page(pdf_path, num_pagina)
+                
+                if pil_full:
+                    # Apply preprocessing pipeline to fallback image
+                    pil_full = self._apply_preprocessing(pil_full)
+                    
+                    # Apply magnification logic to fallback image
+                    pil_full = self._apply_magnification(pil_full)
+                    
+                    nombre_archivo = f"{nombre_pdf}_pag{num_pagina}_full.png"
+                    ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+                    
+                    try:
+                        pil_full.save(ruta_completa, format="PNG")
+                        
+                        try:
+                            ocr_text = pytesseract.image_to_string(pil_full).strip()[:300]
+                        except Exception:
+                            ocr_text = ""
+
+                        texto_completo_pagina = _texto_pagina_con_contexto(doc, idx_0)
+                        # Fallback: sin bbox, buscar solo refs "Fig./Imagen"
+                        refs = re.findall(
+                            r'(?:Fig(?:ura)?\.?\s*\d+[A-Za-z]?[^.]*\.)|(?:Imagen\s+\d+[\.\d]*[^.]*\.)',
+                            texto_completo_pagina, re.IGNORECASE
+                        )
+                        caption_fb = "\n".join(refs[:3]) if refs else ""
+
+                        etiqueta_fb = self._extraer_etiqueta_imagen(caption_fb)
+                        if not etiqueta_fb:
+                            etiqueta_fb = self._extraer_etiqueta_imagen(texto_completo_pagina)
+
+                        imagenes_extraidas.append({
+                            "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
+                            "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
+                            "texto_pagina": texto_completo_pagina,
+                            "caption": caption_fb,
+                            "nombre_archivo": nombre_archivo,
+                            "etiqueta": etiqueta_fb
+                        })
+                    except Exception as e:
+                        print(f"  ⚠️ Error guardando fallback pág {num_pagina}: {e}")
+
+        doc.close()
+        print(f"  📸 {len(imagenes_extraidas)} imágenes procesadas de {os.path.basename(pdf_path)}")
+        return imagenes_extraidas
 
     def extraer_de_directorio(self, directorio: str) -> List[Dict[str, str]]:
         todas = []
         pdfs  = glob.glob(os.path.join(directorio, "*.pdf"))
-        print(f"📂 Extrayendo imágenes de {len(pdfs)} PDFs...")
+        print(f"📂 Extrayendo {len(pdfs)} PDFs...")
         for pdf_path in pdfs:
             todas.extend(self.extraer_de_pdf(pdf_path))
-        print(f"✅ Total imágenes extraídas: {len(todas)}")
+        print(f"✅ Total imágenes: {len(todas)}")
         return todas
 
 
@@ -1315,20 +1743,24 @@ class AgentState(TypedDict):
     tiempo_inicio:               float
     analisis_visual:             Optional[str]
     tiene_imagen:                bool
-    imagen_es_nueva:             bool
+    imagen_es_nueva:             bool           # True si se subió en ESTE turno
     contexto_suficiente:         bool
     temario:                     List[str]
     tema_valido:                 bool
     tema_encontrado:             Optional[str]
     imagenes_recuperadas:        List[str]
+    imagenes_texto_map:          Dict[str, str]   # path -> texto descriptivo del manual
     analisis_comparativo:        Optional[str]
     estructura_identificada:     Optional[str]
     similitud_semantica_dominio: float
     confianza_baja:              bool
+    mostrar_imagenes:            bool
+    imagenes_para_mostrar:       List[Dict[str, str]]  # [{path, caption, nombre_archivo, etiqueta}]
+    historial_conversacional:    str
 
 
 # =============================================================================
-# ASISTENTE PRINCIPAL v5.1
+# ASISTENTE PRINCIPAL v4.1
 # =============================================================================
 
 class AsistenteHistologiaQdrant:
@@ -1344,12 +1776,12 @@ class AsistenteHistologiaQdrant:
         self.memory_saver    = None
         self.contenido_base  = ""
 
-        self.uni        = None
-        self.plip       = None
+        self.uni   = None
+        self.plip  = None
         self.embeddings = None
-        self.embed_dim  = DIM_TEXTO_GEMINI
+        self.embed_dim = DIM_TEXTO
 
-        self.qdrant_store: Optional[QdrantVectorStore] = None
+        self.neo4j: Optional[QdrantVectorStore] = None
 
         self.extractor_imagenes       = ExtractorImagenesPDF(DIRECTORIO_IMAGENES)
         self.extractor_temario        = None
@@ -1361,33 +1793,43 @@ class AsistenteHistologiaQdrant:
             try:
                 cap = torch.cuda.get_device_capability(0)
                 if cap[0] < 7:
-                    print(f"⚠️ GPU incompatible (sm_{cap[0]}{cap[1]}). Forzando CPU.")
+                    print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]}). Forzando CPU para evitar fallback_error.")
                     self.device = "cpu"
-            except Exception:
+            except:
                 pass
-        print(f"✅ AsistenteHistologiaQdrant v5.1 inicializado en {self.device}")
+        print(f"✅ AsistenteHistologiaQdrant v4.2 inicializado en {self.device}")
 
     def _setup_apis(self):
         os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY") or ""
         print("✅ APIs configuradas")
 
+    # ------------------------------------------------------------------
+    # Inicialización
+    # ------------------------------------------------------------------
+
     async def inicializar_componentes(self):
         self._init_modelos()
-        self.memoria = SemanticMemory(
-            llm=self.llm, embeddings=self.embeddings, uni=self.uni, plip=self.plip
+        self.memoria             = SemanticMemory(
+            llm=self.llm,
+            embeddings=self.embeddings,
+            uni=self.uni,
+            plip=self.plip
         )
         self.extractor_temario   = ExtractorTemario(llm=self.llm)
         self.extractor_entidades = ExtractorEntidades(llm=self.llm)
         self.clasificador_semantico = ClasificadorSemantico(
-            llm=self.llm, embeddings=self.embeddings, device=self.device, temario=[]
+            llm=self.llm,
+            embeddings=self.embeddings, # Gemini
+            device=self.device,
+            temario=[]   # se actualizará tras extraer el temario
         )
 
-        self.qdrant_store = QdrantVectorStore(
-            url     = userdata.get("QDRANT_URL") or os.getenv("QDRANT_URL"),
-            api_key = userdata.get("QDRANT_KEY") or os.getenv("QDRANT_KEY"),
+        self.neo4j = QdrantVectorStore(
+            url     = userdata.get("QDRANT_URL")      or os.getenv("QDRANT_URL"),
+            api_key = userdata.get("QDRANT_KEY")      or os.getenv("QDRANT_KEY"),
         )
-        await self.qdrant_store.connect()
-        await self.qdrant_store.crear_esquema()
+        await self.neo4j.connect()
+        await self.neo4j.crear_esquema()
 
         self.memory_saver   = MemorySaver()
         self._crear_grafo()
@@ -1401,25 +1843,26 @@ class AsistenteHistologiaQdrant:
             temperature=0, max_retries=1
         )
         print("✅ Groq inicializado")
-
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001",
-            google_api_key=userdata.get("GOOGLE_API_KEY"),
-            max_retries=1
+        
+        # Inicializar Embeddings (HuggingFace)
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': self.device}
         )
-        print("✅ Embeddings Gemini inicializados")
+        print("✅ Embeddings HuggingFace inicializados")
 
+        # Cargar Modelos (UNI + PLIP)
         self.plip = PlipWrapper(self.device)
         self.plip.load()
-
+        
         self.uni = UniWrapper(self.device)
         self.uni.load()
 
     def _init_imagebind(self):
-        pass
+        pass # ImageBind eliminado
 
     # ------------------------------------------------------------------
-    # Grafo LangGraph
+    # Grafo LangGraph v4.1
     # ------------------------------------------------------------------
 
     def _crear_grafo(self):
@@ -1429,7 +1872,7 @@ class AsistenteHistologiaQdrant:
         g.add_node("procesar_imagen",      self._nodo_procesar_imagen)
         g.add_node("clasificar",           self._nodo_clasificar)
         g.add_node("generar_consulta",     self._nodo_generar_consulta)
-        g.add_node("buscar_qdrant",        self._nodo_buscar_qdrant)
+        g.add_node("buscar_neo4j",         self._nodo_buscar_neo4j)
         g.add_node("filtrar_contexto",     self._nodo_filtrar_contexto)
         g.add_node("analisis_comparativo", self._nodo_analisis_comparativo)
         g.add_node("generar_respuesta",    self._nodo_generar_respuesta)
@@ -1437,7 +1880,13 @@ class AsistenteHistologiaQdrant:
         g.add_node("fuera_temario",        self._nodo_fuera_temario)
 
         g.add_edge(START,                  "inicializar")
-        g.add_edge("inicializar",          "procesar_imagen")
+
+        # Router: si hay imagen → procesar_imagen, si solo texto → clasificar
+        g.add_conditional_edges(
+            "inicializar",
+            self._route_por_modo,
+            {"con_imagen": "procesar_imagen", "solo_texto": "clasificar"}
+        )
         g.add_edge("procesar_imagen",      "clasificar")
 
         g.add_conditional_edges(
@@ -1446,24 +1895,188 @@ class AsistenteHistologiaQdrant:
             {"en_temario": "generar_consulta", "fuera_temario": "fuera_temario"}
         )
         g.add_edge("fuera_temario",        "finalizar")
-        g.add_edge("generar_consulta",     "buscar_qdrant")
-        g.add_edge("buscar_qdrant",        "filtrar_contexto")
-        g.add_edge("filtrar_contexto",     "analisis_comparativo")
+        g.add_edge("generar_consulta",     "buscar_neo4j")
+        g.add_edge("buscar_neo4j",         "filtrar_contexto")
+
+        # Router: si hay imagen → analisis_comparativo, si no → generar_respuesta
+        g.add_conditional_edges(
+            "filtrar_contexto",
+            self._route_analisis_comparativo,
+            {"con_imagen": "analisis_comparativo", "sin_imagen": "generar_respuesta"}
+        )
         g.add_edge("analisis_comparativo", "generar_respuesta")
         g.add_edge("generar_respuesta",    "finalizar")
         g.add_edge("finalizar",            END)
 
         self.graph = g
 
+    # ------------------------------------------------------------------
+    # Detección y reescritura
+    # ------------------------------------------------------------------
+
+    async def _detectar_solicitud_imagen(self, consulta: str) -> bool:
+        """Detecta si la consulta solicita EXPLÍCITAMENTE ver una imagen del manual/base de datos
+        usando el LLM para entender la intención del usuario."""
+        try:
+            resp_check = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=(
+                    "Tu tarea es determinar si la consulta del usuario solicita EXPLÍCITAMENTE "
+                    "ver, mostrar o buscar imágenes, fotos o microfotografías en la base de datos "
+                    "o manual.\n"
+                    "Solo debes responder 'SI' si la intención del usuario es pedir que el sistema "
+                    "le muestre una imagen (ej: 'mostrame una imagen de...', 'quiero ver fotos de...', "
+                    "'podes mostrarme imagenes').\n"
+                    "Debes responder 'NO' si la palabra 'imagen' se usa en otro contexto (ej: 'qué se "
+                    "ve en esta imagen', 'describe la imagen', 'analiza esta foto').\n"
+                    "Respondé SOLO con 'SI' o 'NO'."
+                )),
+                HumanMessage(content=f"CONSULTA: {consulta}")
+            ])
+            return resp_check.content.strip().upper().startswith("SI")
+        except Exception as e:
+            print(f"⚠️ Error en detección de intención de imagen por LLM: {e}")
+            return False
+
+    async def _reescribir_consulta_con_contexto(self, consulta: str, historial: str) -> str:
+        """Reescribe la consulta resolviendo referencias anafóricas usando el historial.
+        Usa el LLM para detectar si hay referencias y reescribir."""
+        if not historial:
+            return consulta
+        try:
+            # Paso 1: Detectar si necesita reescritura
+            resp_check = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=(
+                    "Determiná si la consulta del usuario hace referencia a temas de la "
+                    "conversación previa (usa pronombres como 'eso', 'esto', o pide 'más sobre' "
+                    "algo mencionado antes). Respondé SOLO con 'SI' o 'NO'."
+                )),
+                HumanMessage(content=f"HISTORIAL:\n{historial}\n\nCONSULTA: {consulta}")
+            ])
+            necesita = "SI" in resp_check.content.strip().upper() or "SÍ" in resp_check.content.strip().upper()
+            if not necesita:
+                return consulta
+            
+            # Paso 2: Reescribir
+            resp = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=(
+                    "Reescribí la siguiente consulta del usuario para que sea autocontenida, "
+                    "resolviendo cualquier referencia a temas previos usando el historial. "
+                    "Devolvé SOLO la consulta reescrita, sin explicaciones."
+                )),
+                HumanMessage(content=f"HISTORIAL:\n{historial}\n\nCONSULTA ACTUAL: {consulta}")
+            ])
+            reescrita = resp.content.strip()
+            if reescrita:
+                print(f"   🔄 Consulta reescrita: '{consulta}' → '{reescrita}'")
+                return reescrita
+            return consulta
+        except Exception as e:
+            print(f"   ⚠️ Error reescribiendo consulta: {e}")
+            return consulta
+
+    def _route_por_modo(self, state: AgentState) -> str:
+        """Decide si procesar imagen o ir directo a clasificar (texto puro).
+        Usa el LLM como orquestador cuando hay imagen en memoria."""
+        imagen_path = state.get("imagen_path")
+        tiene_imagen_nueva = imagen_path and os.path.exists(imagen_path)
+        tiene_imagen_memoria = self.memoria and self.memoria.tiene_imagen_previa()
+        
+        hace_referencia_imagen = False
+        
+        # Si hay imagen nueva, siempre modo multimodal (no necesita LLM)
+        if tiene_imagen_nueva:
+            modo = "con_imagen"
+            hace_referencia_imagen = True
+            print("🖼️ Modo multimodal detectado (imagen nueva)")
+        elif tiene_imagen_memoria:
+            # Usar LLM para decidir si la consulta hace referencia a la imagen
+            consulta = state.get("consulta_texto", "")
+            try:
+                resp = invoke_con_reintento_sync(self.llm, [
+                    SystemMessage(content=(
+                        "Sos un clasificador estricto. El usuario tiene una imagen histológica "
+                        "subida previamente en el chat. Determiná si su consulta ACTUAL necesita "
+                        "analizar esa imagen, o si es una pregunta teórica que NO requiere la imagen.\n\n"
+                        "REGLA PRINCIPAL: En caso de duda, respondé TEXTO. Solo respondé IMAGEN "
+                        "si la consulta CLARAMENTE necesita ver/analizar la imagen subida.\n\n"
+                        "Respondé SOLO con 'IMAGEN' o 'TEXTO'.\n\n"
+                        "IMAGEN (necesita la imagen subida):\n"
+                        "- 'qué es esto?' → IMAGEN\n"
+                        "- 'describí lo que ves' → IMAGEN\n"
+                        "- 'analizá la muestra' → IMAGEN\n"
+                        "- 'qué se observa en la imagen?' → IMAGEN\n"
+                        "- 'qué tejido es el de la foto?' → IMAGEN\n\n"
+                        "TEXTO (pregunta teórica, NO necesita la imagen):\n"
+                        "- 'qué es el tejido epitelial?' → TEXTO\n"
+                        "- 'explicame la sarcomera' → TEXTO\n"
+                        "- 'cuáles son los tipos de tejido conectivo?' → TEXTO\n"
+                        "- 'qué es el tejido muscular estriado?' → TEXTO\n"
+                        "- 'mostrame una imagen de cartílago' → TEXTO\n"
+                        "- 'qué características tiene el tejido óseo?' → TEXTO\n"
+                        "- 'hablame del tejido nervioso' → TEXTO"
+                    )),
+                    HumanMessage(content=f"CONSULTA: {consulta}")
+                ])
+                resultado = resp.content.strip().upper()
+                hace_referencia_imagen = resultado.startswith("IMAGEN")
+                print(f"   🤖 Clasificador de modo: '{consulta}' → {resultado}")
+            except Exception as e:
+                print(f"   ⚠️ Error en clasificador de modo, fallback a texto: {e}")
+                hace_referencia_imagen = False
+            
+            if hace_referencia_imagen:
+                modo = "con_imagen"
+                print("🖼️ Modo multimodal detectado (imagen en memoria + referencia en consulta)")
+            else:
+                modo = "solo_texto"
+                print("📝 Modo solo texto — consulta teórica (ignorando imagen en memoria)")
+        else:
+            modo = "solo_texto"
+            print("📝 Modo solo texto — sin imagen disponible")
+        
+        # Registrar modo en trayectoria
+        state["trayectoria"].append({
+            "nodo": "Router:_route_por_modo",
+            "modo_detectado": modo,
+            "tiene_imagen_nueva": tiene_imagen_nueva,
+            "tiene_imagen_memoria": tiene_imagen_memoria,
+            "hace_referencia_imagen": hace_referencia_imagen
+        })
+        
+        return modo
+
+    def _route_analisis_comparativo(self, state: AgentState) -> str:
+        """Salta análisis comparativo si no hay imagen."""
+        if state.get("tiene_imagen") and state.get("imagen_path"):
+            return "con_imagen"
+        return "sin_imagen"
+
     def _route_por_temario(self, state: AgentState) -> str:
-        return "en_temario" if state.get("tema_valido", True) else "fuera_temario"
+        return "en_temario"
 
     # ------------------------------------------------------------------
     # Nodos
     # ------------------------------------------------------------------
 
     async def _nodo_inicializar(self, state: AgentState) -> AgentState:
-        print("📝 Inicializando flujo v5.1 (Qdrant)")
+        print("📝 Inicializando flujo v4.2 (Neo4j + Conversacional)")
+        
+        consulta_original = state.get("consulta_texto", "")
+        
+        # Obtener historial conversacional
+        historial = self.memoria.get_history_for_prompt(5)
+        state["historial_conversacional"]    = historial
+        
+        # Reescribir consulta si tiene referencias anafóricas
+        consulta_reescrita = await self._reescribir_consulta_con_contexto(consulta_original, historial)
+        if consulta_reescrita != consulta_original:
+            state["consulta_texto"] = consulta_reescrita
+        
+        # Detectar si el usuario pide imágenes del contenido
+        state["mostrar_imagenes"]            = await self._detectar_solicitud_imagen(consulta_original)
+        if state["mostrar_imagenes"]:
+            print("   🖼️ Solicitud de imagen detectada")
+        
         state["contexto_memoria"]            = self.memoria.get_context(state.get("consulta_texto", ""))
         state["contenido_base"]              = self.contenido_base
         state["tiempo_inicio"]               = time.time()
@@ -1481,10 +2094,16 @@ class AsistenteHistologiaQdrant:
         state["estructura_identificada"]     = None
         state["texto_embedding"]             = None
         state["similitud_semantica_dominio"] = 0.0
-        state["trayectoria"]                 = [{"nodo": "Inicializar", "tiempo": 0}]
+        state["trayectoria"] = [{"nodo": "Inicializar", "tiempo": 0}]
         return state
 
     async def _nodo_procesar_imagen(self, state: AgentState) -> AgentState:
+        """
+        Tres casos:
+          1. Imagen nueva este turno → procesarla y registrarla en memoria.
+          2. Sin imagen nueva pero hay activa en memoria → reutilizarla.
+          3. Sin imagen en ningún lado → modo texto puro.
+        """
         t0 = time.time()
         print("🖼️ Procesando imagen...")
 
@@ -1494,30 +2113,38 @@ class AsistenteHistologiaQdrant:
         if imagen_path_nuevo and os.path.exists(imagen_path_nuevo):
             imagen_path_activo = imagen_path_nuevo
             imagen_es_nueva    = True
-            self.memoria.set_imagen(imagen_path_activo)
+            # Se registrará en la memoria con su análisis después de generarlo
             print(f"   🆕 Nueva imagen: {imagen_path_activo}")
+
         elif self.memoria.tiene_imagen_previa():
             imagen_path_activo = self.memoria.get_imagen_activa()
             state["imagen_path"] = imagen_path_activo
-            print(f"   ♻️  Reutilizando imagen del turno {self.memoria.imagen_turno_subida}: "
+            state["analisis_visual"] = self.memoria.analisis_visual_activo
+            print(f"   ♻️  Reutilizando imagen del turno "
+                  f"{self.memoria.imagen_turno_subida}: "
                   f"{os.path.basename(imagen_path_activo)}")
+
         else:
             imagen_path_activo = None
 
         if imagen_path_activo and os.path.exists(imagen_path_activo):
             try:
-                emb_u = self.uni.embed_image(imagen_path_activo)
-                emb_p = self.plip.embed_image(imagen_path_activo)
-
-                state["imagen_embedding_uni"]  = emb_u.tolist()
-                state["imagen_embedding_plip"] = emb_p.tolist()
-                state["tiene_imagen"]          = True
-                state["imagen_es_nueva"]       = imagen_es_nueva
+                # User images: apply preprocessing for consistency with indexed images
+                emb_u = self.uni.embed_image(imagen_path_activo, preprocess=True)
+                emb_p = self.plip.embed_image(imagen_path_activo, preprocess=True)
+                
+                state["imagen_embedding_uni"]   = emb_u.tolist()
+                state["imagen_embedding_plip"]  = emb_p.tolist()
+                
+                state["tiene_imagen"]     = True
+                state["imagen_es_nueva"]  = imagen_es_nueva
 
                 if imagen_es_nueva or not state.get("analisis_visual"):
                     state["analisis_visual"] = await self._describir_imagen_histologica(
                         imagen_path_activo
                     )
+                    # Guardar en memoria para que persista entre turnos
+                    self.memoria.set_imagen(imagen_path_activo, state["analisis_visual"])
                     print(f"   🔬 Análisis visual generado ({len(state['analisis_visual'])} chars)")
                 else:
                     print("   ♻️  Reutilizando análisis visual previo del contexto")
@@ -1526,10 +2153,10 @@ class AsistenteHistologiaQdrant:
             except Exception as e:
                 print(f"❌ Error imagen: {e}")
                 import traceback; traceback.print_exc()
-                state["imagen_embedding_uni"]  = None
-                state["imagen_embedding_plip"] = None
-                state["analisis_visual"]       = None
-                state["tiene_imagen"]          = False
+                state["imagen_embedding_uni"]   = None
+                state["imagen_embedding_plip"]  = None
+                state["analisis_visual"]  = None
+                state["tiene_imagen"]     = False
         else:
             print("ℹ️ Sin imagen — modo texto")
             state["imagen_embedding"] = None
@@ -1538,8 +2165,10 @@ class AsistenteHistologiaQdrant:
             state["imagen_es_nueva"]  = False
 
         state["trayectoria"].append({
-            "nodo": "ProcesarImagen", "tiene_imagen": state["tiene_imagen"],
-            "imagen_es_nueva": imagen_es_nueva, "tiempo": round(time.time()-t0, 2)
+            "nodo":            "ProcesarImagen",
+            "tiene_imagen":    state["tiene_imagen"],
+            "imagen_es_nueva": imagen_es_nueva,
+            "tiempo":          round(time.time()-t0, 2)
         })
         return state
 
@@ -1554,11 +2183,22 @@ class AsistenteHistologiaQdrant:
             )
             msg = HumanMessage(content=[
                 {"type": "text", "text": (
-                    "Describe esta imagen histológica.\n\n"
-                    "PARTE 1 — DESCRIPCIÓN GENERAL: tipo tejido, coloración, aumento, estructuras.\n\n"
+                    "Describe esta imagen histológica con máximo rigor.\n\n"
+                    "PARTE 1 — DESCRIPCIÓN OBJETIVA (sin nombrar el tejido aún):\n"
+                    "Describí SOLO lo que ves: coloración de la matriz, forma y disposición "
+                    "de las células, presencia/ausencia de canalículos, vasos sanguíneos, "
+                    "fibras visibles, capas envolventes. NO clasifiques todavía.\n\n"
                     f"PARTE 2 — FEATURES DISCRIMINATORIAS:\n{features_lista}\n\n"
-                    "PARTE 3 — DIAGNÓSTICO DIFERENCIAL: 3 estructuras más probables, "
-                    "diferencias morfológicas, ¿confundible con cuerpo de albicans?"
+                    "PARTE 3 — DIAGNÓSTICO DIFERENCIAL (mínimo 3 opciones):\n"
+                    "⚠️ ERRORES COMUNES A EVITAR:\n"
+                    "- Cartílago hialino vs Tejido óseo: ambos tienen células en lagunas, "
+                    "pero el cartílago tiene matriz VÍTREA/HOMOGÉNEA basófila y condrocitos "
+                    "en NIDOS ISÓGENOS, mientras que el hueso tiene matriz CALCIFICADA con "
+                    "CANALÍCULOS y osteocitos AISLADOS con prolongaciones.\n"
+                    "- Cartílago hialino vs elástico vs fibroso: diferenciar por fibras en la matriz.\n"
+                    "- Si ves lagunas con células redondeadas en grupos y matriz homogénea "
+                    "sin canalículos ni osteonas, es CARTÍLAGO, no hueso.\n\n"
+                    "Para cada opción, listá las evidencias a favor y en contra."
                 )},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
             ])
@@ -1569,18 +2209,25 @@ class AsistenteHistologiaQdrant:
             return ""
 
     async def _nodo_clasificar(self, state: AgentState) -> AgentState:
+        """
+        1. Extrae términos histológicos y entidades para la búsqueda.
+        2. Usa ClasificadorSemantico (ImageBind + LLM) para verificar dominio.
+           Reemplaza la verificación por keywords de v4.0.
+        """
         t0 = time.time()
-        print("🔍 Clasificando consulta (semántico v5.1)...")
+        print("🔍 Clasificando consulta (semántico v4.1)...")
 
+        # ── Extracción de términos ─────────────────────────────────────
+        # SOLO extraer de la consulta del usuario y contexto de memoria.
+        # NO incluir analisis_visual: es la interpretación del LLM sobre la imagen
+        # y pre-clasificaría el tejido antes de buscarlo (sesga la búsqueda textual).
+        # La búsqueda visual se hace por embeddings UNI/PLIP, no por texto.
         system = (
             "Extrae términos técnicos histológicos de la consulta.\n"
             "Devuelve:\nTEJIDO: [...]\nESTRUCTURA: [...]\nCONCEPTO: [...]\n"
             "TINCIÓN: [...]\nTÉRMINOS_CLAVE: [...]"
         )
         partes = [f"CONSULTA:\n{state['consulta_texto']}"]
-        analisis_visual = _safe(state.get("analisis_visual"))
-        if analisis_visual:
-            partes.append(f"ANÁLISIS VISUAL:\n{analisis_visual[:600]}")
         contexto_mem = _safe(state.get("contexto_memoria"))
         if contexto_mem and contexto_mem != "No hay consultas previas.":
             partes.append(f"CONTEXTO:\n{contexto_mem[:300]}")
@@ -1594,20 +2241,25 @@ class AsistenteHistologiaQdrant:
         except Exception as e:
             state["terminos_busqueda"] = state["consulta_texto"]
 
-        texto_para_entidades = (
-            state["consulta_texto"] + " " + _safe(state.get("analisis_visual"))
-        )
+        # ── Entidades para búsqueda por grafo ──────────────────────────
+        # SOLO extraer entidades de la consulta del usuario.
+        # NO incluir analisis_visual porque es una interpretación del LLM
+        # que puede alucinar (ej: confundir cartílago con hueso) y
+        # contaminar la búsqueda con entidades incorrectas.
         state["entidades_consulta"] = await self.extractor_entidades.extraer_de_texto(
-            texto_para_entidades
+            state["consulta_texto"]
         )
         print(f"   🏷️ Entidades: {state['entidades_consulta']}")
 
+        # ── Embedding del texto de consulta (Gemini) ───────────────────
         try:
-            state["texto_embedding"] = self._embed_texto_gemini(state["consulta_texto"])
+            emb_texto = self._embed_texto(state["consulta_texto"])
+            state["texto_embedding"] = emb_texto
         except Exception as e:
             print(f"⚠️ Error embedding texto: {e}")
             state["texto_embedding"] = None
 
+        # ── Clasificación semántica de dominio ─────────────────────────
         verificacion = await self.clasificador_semantico.clasificar(
             consulta       = state["consulta_texto"],
             analisis_visual= state.get("analisis_visual"),
@@ -1625,12 +2277,13 @@ class AsistenteHistologiaQdrant:
               f"Método: {verificacion.get('metodo')}")
 
         state["trayectoria"].append({
-            "nodo": "Clasificar", "tema_valido": state["tema_valido"],
-            "tema_encontrado": state["tema_encontrado"],
-            "entidades": state["entidades_consulta"],
-            "similitud_dominio": state["similitud_semantica_dominio"],
-            "metodo_clasificacion": verificacion.get("metodo"),
-            "tiempo": round(time.time()-t0, 2)
+            "nodo":                  "Clasificar",
+            "tema_valido":           state["tema_valido"],
+            "tema_encontrado":       state["tema_encontrado"],
+            "entidades":             state["entidades_consulta"],
+            "similitud_dominio":     state["similitud_semantica_dominio"],
+            "metodo_clasificacion":  verificacion.get("metodo"),
+            "tiempo":                round(time.time()-t0, 2)
         })
         return state
 
@@ -1693,99 +2346,163 @@ class AsistenteHistologiaQdrant:
         })
         return state
 
-    async def _nodo_buscar_qdrant(self, state: AgentState) -> AgentState:
+    async def _nodo_buscar_neo4j(self, state: AgentState) -> AgentState:
         t0 = time.time()
-        print("📚 Búsqueda híbrida Qdrant v5.1...")
+        print("📚 Búsqueda híbrida Neo4j...")
 
-        resultados = await self.qdrant_store.busqueda_hibrida(
+        # Inyectar palabras clave de la consulta en entidades para búsqueda por keywords
+        entidades = dict(state.get("entidades_consulta", {}))
+        consulta_texto = state.get("consulta_busqueda_texto", "") or state.get("consulta_texto", "")
+        # Extraer palabras significativas (>3 chars) como keywords de búsqueda
+        stopwords = {"para", "como", "sobre", "este", "esta", "estos", "estas", "podes",
+                     "puede", "mostrar", "mostrame", "dame", "quiero", "tipo", "tipos",
+                     "explicar", "describir", "decir", "imagen", "imágenes", "imagenes",
+                     "ejemplo", "ejemplos", "favor", "hablar", "habla", "cuál", "cual",
+                     "cuáles", "cuales", "qué", "que", "cómo", "donde", "dónde", "tiene"}
+        palabras_consulta = [
+            w.strip("¿?¡!.,;:()\"'") for w in consulta_texto.lower().split()
+            if len(w.strip("¿?¡!.,;:()\"'")) > 3 and w.strip("¿?¡!.,;:()\"'") not in stopwords
+        ]
+        entidades["_consulta"] = palabras_consulta
+
+        resultados = await self.neo4j.busqueda_hibrida(
             texto_embedding        = state.get("texto_embedding"),
             imagen_embedding_uni   = state.get("imagen_embedding_uni"),
             imagen_embedding_plip  = state.get("imagen_embedding_plip"),
-            entidades              = state.get("entidades_consulta", {}),
+            entidades              = entidades,
             top_k                  = 10
         )
 
+        tejidos = state.get("entidades_consulta", {}).get("tejidos", [])
+        if len(tejidos) >= 2:
+            camino = await self.neo4j.busqueda_camino_semantico(tejidos[0], tejidos[1])
+            if camino:
+                print(f"   🗺️ Camino semántico: {len(camino)} nodos")
+                resultados.extend(camino)
+
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
+
+        # --- Imágenes para mostrar: prioridad a las vinculadas por los chunks ---
+        if state.get("mostrar_imagenes", False):
+            print("   🖼️ Extrayendo imágenes desde chunks recuperados...")
+            imgs_desde_chunks = []
+            vistas_chunks = set()
+
+            # Fuente primaria: imágenes_pagina de los chunks de texto (relación directa PDF)
+            for r in resultados:
+                if r.get("tipo") != "texto":
+                    continue
+                for img_path in r.get("imagenes_pagina", []):
+                    if img_path and os.path.exists(img_path) and img_path not in vistas_chunks:
+                        nombre = os.path.basename(img_path).lower()
+                        if "_full." in nombre:
+                            continue
+                        vistas_chunks.add(img_path)
+                        imgs_desde_chunks.append({
+                            "id": img_path,
+                            "path": img_path,
+                            "nombre_archivo": os.path.basename(img_path),
+                            "caption": r.get("texto", "")[:300],
+                            "etiqueta": "",
+                            "fuente": r.get("fuente", ""),
+                            "similitud_semantica": r.get("similitud", 0.5),
+                        })
+
+            if imgs_desde_chunks:
+                imgs_para_mostrar = imgs_desde_chunks[:3]
+                print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas de chunks (fuente directa)")
+            else:
+                # Fallback: búsqueda semántica independiente
+                print("   🔎 Sin imágenes en chunks — búsqueda semántica de imágenes...")
+                imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
+                    texto_embedding=state.get("texto_embedding", []),
+                    entidades=entidades,
+                    embeddings_model=self.embeddings,
+                    top_k=3
+                )
+                if imgs_para_mostrar:
+                    print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por búsqueda semántica")
+                else:
+                    print("   ⚠️ No se encontraron imágenes relevantes para mostrar")
+
+            state["imagenes_para_mostrar"] = imgs_para_mostrar
+            if imgs_para_mostrar and not state.get("contexto_suficiente"):
+                state["contexto_suficiente"] = True
+
         state["trayectoria"].append({
-            "nodo": "BuscarQdrant", "hits": len(resultados),
+            "nodo": "BuscarNeo4j", "hits": len(resultados),
+            "imagenes_para_mostrar": len(state.get("imagenes_para_mostrar", [])),
             "tiempo": round(time.time()-t0, 2)
         })
         return state
 
     async def _nodo_filtrar_contexto(self, state: AgentState) -> AgentState:
-        """
-        v5.1: al construir bloques de contexto para resultados de tipo imagen,
-        incluye texto_pagina (el texto completo del PDF en esa página).
-        """
         t0     = time.time()
-        umbral = self.SIMILARITY_THRESHOLD
-        validos = [r for r in state["resultados_busqueda"] if r.get("similitud", 0) >= umbral]
+        umbral_imagen = self.SIMILARITY_THRESHOLD
+        es_solo_texto = not state.get("tiene_imagen", False)
+
+        # Umbral de texto más permisivo en modo solo texto
+        # Qdrant cosine scores tienden a ser más bajos que los de Neo4j vector index
+        umbral_texto = 0.30 if es_solo_texto else 0.5
+
+        validos = []
+        for r in state["resultados_busqueda"]:
+            current_sim = r.get("similitud", 0)
+            if r.get("tipo") == "texto" and current_sim < umbral_texto:
+                continue
+            if r.get("tipo") == "imagen" and current_sim < umbral_imagen:
+                continue
+
+            # Si es imagen pero no existe el archivo en disco, lo rechazamos
+            if r.get("tipo") == "imagen":
+                img_p = r.get("imagen_path")
+                if not img_p or not os.path.exists(img_p):
+                    continue
+            validos.append(r)
 
         state["resultados_validos"]  = validos
-        state["contexto_suficiente"] = len(validos) > 0
+        # Contexto suficiente si hay resultados válidos O si se encontraron imágenes para mostrar
+        tiene_imgs_para_mostrar = len(state.get("imagenes_para_mostrar", [])) > 0
+        state["contexto_suficiente"] = len(validos) > 0 or tiene_imgs_para_mostrar
 
         vistas: set = set()
         imagenes_unicas: List[str] = []
+        imagenes_texto: Dict[str, str] = {}
         for r in validos:
             img_path = r.get("imagen_path")
             if img_path and os.path.exists(img_path) and img_path not in vistas:
                 vistas.add(img_path)
                 imagenes_unicas.append(img_path)
-            for img_ref in r.get("imagenes_pagina", []):
-                if img_ref and os.path.exists(img_ref) and img_ref not in vistas:
-                    vistas.add(img_ref)
-                    imagenes_unicas.append(img_ref)
+                imagenes_texto[img_path] = _safe(r.get('texto', ''))[:500]
         state["imagenes_recuperadas"] = imagenes_unicas
+        state["imagenes_texto_map"]   = imagenes_texto
 
         if validos:
             validos_sorted = sorted(validos, key=lambda x: x.get("similitud", 0), reverse=True)
             bloques = []
             for i, r in enumerate(validos_sorted, 1):
-                pag  = r.get("pagina")
-                tipo = r.get("tipo", "?")
-                enc  = (f"[Sección {i} | Fuente: {r.get('fuente','N/A')} | "
-                        f"Tipo: {tipo} | Sim: {r.get('similitud',0):.3f}")
-                if pag:
-                    enc += f" | Pág: {pag}"
+                # Marcar el resultado #1 de imagen como MEJOR MATCH VISUAL
+                es_top_imagen = (i == 1 and r.get('tipo') == 'imagen')
+                marcador = " ⭐ MEJOR MATCH VISUAL" if es_top_imagen else ""
+                enc = (f"[Sección {i}{marcador} | Fuente: {r.get('fuente','N/A')} | "
+                       f"Tipo: {r.get('tipo','?')} | Sim: {r.get('similitud',0):.3f}")
                 if r.get("imagen_path"):
                     enc += f" | Imagen: {os.path.basename(r['imagen_path'])}"
-                imgs_pag = r.get("imagenes_pagina", [])
-                if imgs_pag:
-                    nombres = [os.path.basename(p) for p in imgs_pag]
-                    enc += f" | Imgs misma pág: {', '.join(nombres)}"
                 enc += "]"
-
-                # ── Construir el cuerpo del bloque ────────────────────
-                if tipo == "imagen":
-                    # NUEVO v5.1: para imágenes, incluir AMBOS: ocr_text y
-                    # texto_pagina (el texto del PDF en esa página).
-                    texto_ocr  = _safe(r.get("texto", ""))
-                    texto_pag  = _safe(r.get("texto_pagina", ""))
-                    partes_txt = []
-                    if texto_ocr:
-                        partes_txt.append(f"[OCR imagen]: {texto_ocr[:400]}")
-                    if texto_pag:
-                        partes_txt.append(f"[Texto de la página del PDF]:\n{texto_pag[:1500]}")
-                    texto_ctx = "\n".join(partes_txt) if partes_txt else "(sin texto asociado)"
-                else:
-                    texto_ctx = _safe(r.get("texto", ""))[:1500]
-                    # Para chunks de texto, si hay imágenes en la misma página,
-                    # añadir referencia al texto_pagina si está disponible
-                    if r.get("texto_pagina"):
-                        texto_ctx += f"\n[Contexto adicional de página]: {r['texto_pagina'][:400]}"
-
-                bloques.append(f"{enc}\n{texto_ctx}")
-
+                bloques.append(f"{enc}\n{_safe(r.get('texto',''))[:700]}")
             state["contexto_documentos"] = "\n\n".join(bloques)
-            print(f"✅ {len(validos)} válidos | {len(imagenes_unicas)} imágenes")
+            modo_str = "TEXTO" if es_solo_texto else "IMAGEN+TEXTO"
+            print(f"✅ {len(validos)} válidos | {len(imagenes_unicas)} imgs | Modo: {modo_str}")
         else:
             state["contexto_documentos"] = ""
-            print(f"⚠️ Ningún resultado supera umbral {umbral}")
+            print(f"⚠️ Ningún resultado supera umbral (texto={umbral_texto}, img={umbral_imagen})")
 
         state["trayectoria"].append({
             "nodo": "FiltrarContexto", "hits_validos": len(validos),
-            "imgs": len(state["imagenes_recuperadas"]), "tiempo": round(time.time()-t0, 2)
+            "imgs": len(state["imagenes_recuperadas"]),
+            "modo": "solo_texto" if es_solo_texto else "multimodal",
+            "tiempo": round(time.time()-t0, 2)
         })
         return state
 
@@ -1806,6 +2523,10 @@ class AsistenteHistologiaQdrant:
         if not imagenes_ref:
             print("ℹ️ Sin referencias — análisis comparativo omitido")
             state["analisis_comparativo"] = None
+            # Evitar alucinaciones: si hay imagen pero no matches, invalidar contexto
+            state["contexto_documentos"] = ""
+            state["contexto_suficiente"] = False
+            state["imagenes_recuperadas"] = []
             state["trayectoria"].append({
                 "nodo": "AnalisisComparativo", "motivo": "sin referencias",
                 "tiempo": round(time.time()-t0, 2)
@@ -1835,24 +2556,17 @@ class AsistenteHistologiaQdrant:
 
         analisis_previo = _safe(state.get("analisis_visual"))
         if analisis_previo:
-            content_parts.append({"type": "text",
-                                   "text": f"\nAnálisis previo:\n{analisis_previo[:600]}\n"})
-
-        # NUEVO v5.1: incluir el texto_pagina de cada imagen de referencia
-        # para que el LLM tenga el contexto textual del manual al compararlas.
-        for i, ref_path in enumerate(imagenes_ref, 1):
             content_parts.append({"type": "text", "text": (
-                f"\n=== REFERENCIA #{i} ({os.path.basename(ref_path)}) ==="
+                f"\nAnálisis previo:\n{analisis_previo[:600]}\n"
             )})
-            # Buscar texto_pagina de esta referencia en resultados válidos
-            texto_pag_ref = ""
-            for r in state.get("resultados_validos", []):
-                if r.get("imagen_path") == ref_path and r.get("texto_pagina"):
-                    texto_pag_ref = r["texto_pagina"]
-                    break
-            if texto_pag_ref:
-                content_parts.append({"type": "text",
-                                       "text": f"[Texto del manual en esta página]:\n{texto_pag_ref[:800]}\n"})
+
+        imagenes_texto = state.get("imagenes_texto_map", {})
+        for i, ref_path in enumerate(imagenes_ref, 1):
+            texto_ref = imagenes_texto.get(ref_path, "Sin descripción disponible")
+            content_parts.append({"type": "text", "text": (
+                f"\n=== REFERENCIA #{i} ({os.path.basename(ref_path)}) ===\n"
+                f"DESCRIPCIÓN DEL MANUAL: {texto_ref}"
+            )})
             try:
                 with open(ref_path, "rb") as f:
                     data_r = base64.b64encode(f.read()).decode("utf-8")
@@ -1869,25 +2583,54 @@ class AsistenteHistologiaQdrant:
         content_parts.append({"type": "text", "text": (
             "\n=== INSTRUCCIONES ESTRICTAS ===\n"
             f"Compara rigurosamente basándote en:\n{features_lista}\n\n"
-            "TU ROL ES SER UN JUEZ ESCÉPTICO. Tu objetivo principal es encontrar las DIFERENCIAS "
-            "que demuestren que NO son el mismo tejido.\n\n"
+            "IMPORTANTE: Cada referencia incluye la DESCRIPCIÓN DEL MANUAL. "
+            "Usa esa descripción como fuente de verdad para identificar la estructura, "
+            "NO tu propia interpretación visual.\n\n"
+            "TU ROL ES SER UN EVALUADOR OBJETIVO. Tu objetivo principal es determinar verdaderamente si la imagen de consulta y las referencias muestran la misma estructura histológica.\n\n"
             "1. TABLA COMPARATIVA (Markdown): | Feature | Consulta | Ref#1 | Ref#2 |\n"
-            "2. VEREDICTO DE IDENTIDAD: Si la imagen de consulta parece ser un órgano distinto "
-            "al de las referencias, DEBES declarar EXPLÍCITAMENTE que son TEJIDOS DIFERENTES.\n"
-            "3. CONCLUSIÓN FINAL: ¿Son la misma estructura biológica? (SÍ/NO). "
-            "Si es NO, indica qué crees que es realmente la imagen de la consulta."
+            "2. VEREDICTO DE IDENTIDAD: Evalúa las similitudes morfológicas y declara si son el MISMO TEJIDO o TEJIDOS DIFERENTES.\n"
+            "3. CONCLUSIÓN FINAL: Debes terminar con una de estas dos frases EXACTAS:\n"
+            "   - Si coinciden: 'CONCLUSIÓN: SÍ son la misma estructura histológica'\n"
+            "   - Si NO coinciden: 'CONCLUSIÓN: TEJIDOS DIFERENTES'\n"
+            "   Si hay dudas pero las similitudes son significativas, considera que SÍ coinciden."
         )})
 
         try:
             resp = await invoke_con_reintento(self.llm, [HumanMessage(content=content_parts)])
-            state["analisis_comparativo"]    = resp.content
-            state["estructura_identificada"] = await self._extraer_estructura(resp.content)
+            state["analisis_comparativo"] = resp.content
             print(f"✅ Análisis comparativo: {len(resp.content)} chars")
-            print(f"   → Estructura: {state['estructura_identificada']}")
         except Exception as e:
             print(f"❌ Error análisis comparativo: {e}")
-            state["analisis_comparativo"]    = None
-            state["estructura_identificada"] = None
+            state["analisis_comparativo"] = None
+
+        estructura_db = None
+        son_diferentes = False
+        analisis_str = state.get("analisis_comparativo", "")
+        if analisis_str and ("TEJIDOS DIFERENTES" in analisis_str or "NO son la misma" in analisis_str):
+            son_diferentes = True
+
+        if not son_diferentes:
+            imagenes_texto = state.get("imagenes_texto_map", {})
+            imagenes_rec = state.get("imagenes_recuperadas", [])
+            if imagenes_rec and imagenes_texto:
+                top_match_path = imagenes_rec[0]
+                top_caption = imagenes_texto.get(top_match_path, "")
+                if top_caption:
+                    primera_linea = top_caption.split('\n')[0].strip()
+                    match = re.match(r'Imagen\s+[\d.]+[A-Za-z]?\.\s*(.*)', primera_linea)
+                    if match:
+                        estructura_db = match.group(1).rstrip('.')
+                    else:
+                        estructura_db = primera_linea
+                    print(f"   → Estructura (DB): {estructura_db} [de {os.path.basename(top_match_path)}]")
+        else:
+            print("   → Análisis comparativo concluyó que son TEJIDOS DIFERENTES. Imagen no en BD.")
+            # Limpiar contexto para evitar alucinaciones
+            state["contexto_documentos"] = ""
+            state["contexto_suficiente"] = False
+            state["imagenes_recuperadas"] = []
+        
+        state["estructura_identificada"] = estructura_db
 
         state["trayectoria"].append({
             "nodo": "AnalisisComparativo", "refs": len(imagenes_ref),
@@ -1899,63 +2642,128 @@ class AsistenteHistologiaQdrant:
     async def _extraer_estructura(self, analisis: str) -> Optional[str]:
         try:
             resp = await invoke_con_reintento(self.llm, [
-                SystemMessage(content="Extrae el nombre de la estructura histológica más probable. Solo el nombre."),
+                SystemMessage(content=(
+                    "Extrae el nombre de la estructura histológica más probable. Solo el nombre."
+                )),
                 HumanMessage(content=analisis[-1000:])
             ])
             return resp.content.strip()
         except Exception:
             return None
 
-    async def _nodo_generar_respuesta(self, state: AgentState) -> AgentState:
-        """
-        v5.1: el contexto_documentos ya incluye texto_pagina para imágenes
-        (armado en _nodo_filtrar_contexto). Aquí simplemente lo pasamos al LLM.
-        """
-        t0 = time.time()
-        print("💭 Generando respuesta v5.1...")
 
-        aviso_db = ""
-        if not state["contexto_suficiente"]:
-            if state.get("tiene_imagen") and state.get("imagen_path"):
-                print("   ⚠️ Sin contexto RAG pero hay imagen — permitiendo chat con imagen")
-                aviso_db = (
-                    "\n\nAVISO PARA EL ASISTENTE: No se encontraron resultados en la base de datos "
-                    "para esta consulta. DEBES informar explícitamente al usuario que no encontraste "
-                    "información referenciada en el manual, pero responde a su pregunta basándote "
-                    "en la imagen subida y el historial de chat."
-                )
-                state["contexto_suficiente"] = True
-            else:
+    async def _nodo_generar_respuesta(self, state: AgentState) -> AgentState:
+        t0 = time.time()
+        es_solo_texto = not state.get("tiene_imagen", False)
+        modo_str = "TEXTO" if es_solo_texto else "MULTIMODAL"
+        print(f"💭 Generando respuesta v4.2 [{modo_str}]...")
+
+        # Si no hay contexto textual PERO sí hay imágenes para mostrar,
+        # no cortamos: dejamos que el LLM genere la respuesta con las imágenes.
+        imagenes_para_mostrar_check = state.get("imagenes_para_mostrar", [])
+        tiene_imgs_mostrar = state.get("mostrar_imagenes", False) and len(imagenes_para_mostrar_check) > 0
+
+        if not state["contexto_suficiente"] and not tiene_imgs_mostrar:
+            if es_solo_texto:
+                # Modo texto sin contexto: respuesta más amable
+                print("   ⚠️ Sin contexto RAG para consulta de texto")
+                temario = state.get("temario") or []
+                muestra = "\n".join(f"  • {t}" for t in temario[:15])
+                if len(temario) > 15:
+                    muestra += f"\n  ... y {len(temario)-15} más"
                 state["respuesta_final"] = (
-                    f"❌ Sin información suficiente (umbral {self.SIMILARITY_THRESHOLD:.0%}).\n"
-                    f"Consulta: {state['consulta_busqueda_texto']}"
+                    "⚠️ **No encontré información específica sobre eso en el manual**\n\n"
+                    "La consulta es válida pero no encontré contenido suficiente en la "
+                    "base de datos del manual para responderla con precisión.\n\n"
+                    f"**Temas disponibles en el manual (muestra):**\n{muestra}\n\n"
+                    "Podés intentar:\n"
+                    "- Reformular la pregunta con términos más específicos\n"
+                    "- Preguntar sobre alguno de los temas listados arriba\n"
+                    "- Subir una imagen histológica para análisis visual"
                 )
-                state["trayectoria"].append({
-                    "nodo": "GenerarRespuesta", "contexto_suficiente": False,
-                    "tiempo": round(time.time()-t0, 2)
-                })
-                return state
+            else:
+                # Modo imagen sin contexto: rechazo estricto
+                print("   ⚠️ Sin contexto RAG — rechazo (imagen no encontrada en DB)")
+                temario = state.get("temario") or []
+                muestra = "\n".join(f"  • {t}" for t in temario[:20])
+                if len(temario) > 20:
+                    muestra += f"\n  ... y {len(temario)-20} más"
+                state["respuesta_final"] = (
+                    "⚠️ **Imagen no encontrada en la base de datos**\n\n"
+                    "La imagen que proporcionaste no parece coincidir con ninguna "
+                    "estructura histológica documentada en el manual actual.\n\n"
+                    f"**Temas disponibles (muestra):**\n{muestra}\n\n"
+                    "Nota: El sistema está diseñado para identificar únicamente las imágenes "
+                    "y variantes presentes en la bibliografía indexada. Si es una imagen "
+                    "externa (como una página entera o de otro libro), es posible que no haya coincidencias."
+                )
+            state["trayectoria"].append({
+                "nodo": "GenerarRespuesta", "contexto_suficiente": False,
+                "modo": "solo_texto" if es_solo_texto else "multimodal",
+                "tiempo": round(time.time()-t0, 2)
+            })
+            return state
+
+        # Si llegamos aquí con imágenes para mostrar pero sin contexto textual,
+        # generamos contexto mínimo a partir de las imágenes encontradas
+        if tiene_imgs_mostrar and not state.get("contexto_documentos"):
+            print("   📸 Usando imágenes encontradas como contexto para la respuesta")
+            bloques_img = []
+            for i, img_info in enumerate(imagenes_para_mostrar_check, 1):
+                etiqueta = img_info.get('etiqueta', '')
+                caption = img_info.get('caption', '')[:500]
+                nombre = img_info.get('nombre_archivo', '')
+                fuente = img_info.get('fuente', '')
+                sim = img_info.get('similitud_semantica', 0)
+                bloques_img.append(
+                    f"[Sección {i} | Fuente: {fuente} | Tipo: imagen | Sim: {sim:.3f} | "
+                    f"Imagen: {nombre}]\n"
+                    f"Etiqueta: {etiqueta}\nDescripción: {caption}"
+                )
+            state["contexto_documentos"] = "\n\n".join(bloques_img)
 
         tiene_comparativo = bool(_safe(state.get("analisis_comparativo")))
-        nota_comp = (
-            "\n\nIMPORTANTE: El análisis comparativo tiene PRIORIDAD en el diagnóstico diferencial."
-            if tiene_comparativo else ""
-        )
+        historial_str = _safe(state.get("historial_conversacional"))
 
-        system_prompt = (
-            "Eres un asistente de histología. Responde SOLO con el contenido del manual o la imagen visible en el chat.\n\n"
-            "REGLAS:\n"
-            "1. Solo información de SECCIONES DEL MANUAL e IMÁGENES DE REFERENCIA guardadas en la base de datos, o la propia imagen que subió el usuario.\n"
-            "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
-            "3. No diagnósticos clínicos salvo que estén explícitos.\n\n"
-            "ESTRUCTURA:\n"
-            "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
-            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si concluye que la imagen del usuario NO ES LA MISMA ESTRUCTURA que las imágenes de referencia del manual, informa al usuario y DETENTE AHÍ.\n"
-            "3. Características histológicas según la base de datos (SOLO si las estructuras coinciden)\n"
-            "4. Conclusión y confianza"
-            f"{nota_comp}{aviso_db}"
+        # ── Instrucción de prosa y continuidad conversacional ──────────
+        instruccion_prosa = (
+            "ESTILO DE RESPUESTA:\n"
+            "- Respondé en prosa, como un profesor explicando en texto corrido.\n"
+            "- Evitá listas con bullets, numeración y formato estructurado rígido.\n"
+            "- Conectá los conceptos de forma fluida entre párrafos.\n"
+            "- Usá un tono didáctico y natural.\n"
         )
+        instruccion_continuidad = ""
+        if historial_str:
+            instruccion_continuidad = (
+                "- Tenés un historial de conversación previo. Adaptá tu respuesta como "
+                "continuación natural del diálogo, sin repetir información ya proporcionada.\n"
+            )
+        
+        instruccion_imagenes = ""
+        
+        # Si el usuario pidió ver imágenes de la BD, agregar instrucción especial
+        imagenes_para_mostrar = state.get("imagenes_para_mostrar", [])
+        if state.get("mostrar_imagenes") and imagenes_para_mostrar:
+            descripciones_imgs = []
+            for i, img_info in enumerate(imagenes_para_mostrar, 1):
+                etiqueta = img_info.get('etiqueta', '')
+                caption = img_info.get('caption', '')[:300]
+                nombre = img_info.get('nombre_archivo', '')
+                desc = f"{i}. **{etiqueta or nombre}**: {caption}"
+                descripciones_imgs.append(desc)
+            imgs_listado = "\n".join(descripciones_imgs)
+            instruccion_imagenes = (
+                "\nIMÁGENES DE REFERENCIA ENCONTRADAS EN LA BASE DE DATOS:\n"
+                "El usuario pidió ver imágenes del manual. Se encontraron las siguientes "
+                "imágenes relevantes que se mostrarán junto a tu respuesta:\n"
+                f"{imgs_listado}\n\n"
+                "INSTRUCCIÓN: Describí brevemente cada imagen encontrada usando la información "
+                "del caption del manual. Indicá qué muestra cada imagen y por qué es relevante "
+                "para la consulta del usuario. Las imágenes se mostrarán automáticamente.\n"
+            )
 
+        # ── Variables del estado necesarias para el system prompt ───────
         analisis_comp_str   = _safe(state.get("analisis_comparativo"))
         estructura_str      = _safe(state.get("estructura_identificada"))
         analisis_visual_str = _safe(state.get("analisis_visual"), "No disponible")
@@ -1964,23 +2772,97 @@ class AsistenteHistologiaQdrant:
         tema_str            = _safe(state.get("tema_encontrado"), "N/A")
         entidades_str       = json.dumps(state.get("entidades_consulta", {}), ensure_ascii=False)
 
+        # Instrucción extra si el análisis comparativo ya identificó la estructura
+        instruccion_estructura = ""
+        if estructura_str:
+            instruccion_estructura = (
+                f"\n⚠️ ESTRUCTURA IDENTIFICADA POR ANÁLISIS COMPARATIVO: {estructura_str}\n"
+                "Esta identificación proviene de una comparación directa imagen-vs-referencia "
+                "y tiene MÁXIMA PRIORIDAD. Usá la descripción del manual CORRESPONDIENTE A ESTA "
+                "ESTRUCTURA. Ignorá descripciones de otras imágenes que hablen de tejidos diferentes.\n"
+            )
+
+        # ── System prompt diferenciado según modo ──────────────────────
+        if es_solo_texto:
+            system_prompt = (
+                "Eres un asistente experto de histología. Respondés consultas de texto "
+                "basándote EXCLUSIVAMENTE en el contenido del manual/base de datos.\n\n"
+                "REGLAS FUNDAMENTALES:\n"
+                "1. FUENTE DE VERDAD: Usá SOLO la información de las SECCIONES DEL MANUAL proporcionadas.\n"
+                "2. CITAS: Citá las fuentes con [Manual: archivo].\n"
+                "3. NO inventes información que no esté en las secciones proporcionadas.\n"
+                "4. Si la información es parcial, indicá qué partes provienen del manual y cuáles no están disponibles.\n"
+                "5. No diagnósticos clínicos salvo que estén explícitos en el manual.\n\n"
+                f"{instruccion_prosa}"
+                f"{instruccion_continuidad}"
+                f"{instruccion_imagenes}"
+            )
+        else:
+            nota_comp = (
+                "\n\nIMPORTANTE: El análisis comparativo tiene PRIORIDAD en el diagnóstico diferencial."
+                if tiene_comparativo else ""
+            )
+            regla_validacion = (
+                "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. "
+                "Si la conclusión final del análisis dice explícitamente 'TEJIDOS DIFERENTES' o 'NO son la misma estructura', "
+                "entonces respondé con algo como: "
+                "'No puedo identificar esta estructura con certeza porque no se encuentra en el contenido del manual disponible. "
+                "Te sugiero consultar con tu docente o subir otra imagen con mejor resolución.' "
+                "Si el análisis menciona 'similitudes', 'coinciden', 'mismo tejido', o 'SÍ son la misma estructura', "
+                "entonces asume que SÍ coinciden y continúa con el paso 3 detallando el tejido según el manual.\n"
+            )
+            system_prompt = (
+                "Eres un asistente de histología. Responde SOLO con el contenido del manual o la imagen visible en el chat.\n\n"
+                "REGLAS FUNDAMENTALES:\n"
+                "1. PRIORIDAD ABSOLUTA: La DESCRIPCIÓN TEXTUAL DEL MANUAL es la fuente de verdad. "
+                   "Si el texto del manual dice 'Tejido nervioso corteza cerebelosa', ESO es lo correcto, "
+                   "sin importar tu propia interpretación visual de la imagen.\n"
+                "   ATENCIÓN: Si se proporciona una 'ESTRUCTURA IDENTIFICADA' por el análisis comparativo, "
+                   "esa estructura es el resultado de una comparación directa imagen-vs-referencia y tiene "
+                   "MÁXIMA PRIORIDAD. Usá la descripción del manual CORRESPONDIENTE A ESA ESTRUCTURA, "
+                   "no la descripción de otras imágenes recuperadas.\n"
+                "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
+                "3. Para cada 'IMAGEN DE REFERENCIA', indica el nombre y la descripción textual del manual.\n"
+                "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
+                   "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
+                "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+                f"{instruccion_estructura}"
+                f"{instruccion_prosa}"
+                f"{instruccion_continuidad}"
+                f"{instruccion_imagenes}"
+                "VALIDACIÓN:\n"
+                f"{regla_validacion}"
+                f"{nota_comp}"
+            )
+
         seccion_comp = (f"\n\n**ANÁLISIS COMPARATIVO:**\n{analisis_comp_str[:2000]}"
                         if analisis_comp_str else "")
         seccion_est  = (f"\n\n**ESTRUCTURA IDENTIFICADA:** {estructura_str}"
                         if estructura_str else "")
 
-        content_parts = [{"type": "text", "text": (
+        content_parts = []
+        
+        # Inyectar historial conversacional si existe
+        if historial_str:
+            content_parts.append({"type": "text", "text": (
+                f"**HISTORIAL DE CONVERSACIÓN:**\n{historial_str}\n\n---\n"
+            )})
+        
+        # Limitar contexto_documentos para no saturar el prompt
+        ctx_docs = state['contexto_documentos']
+        if len(ctx_docs) > 4000:
+            ctx_docs = ctx_docs[:4000] + "\n... [contexto truncado]"
+        
+        content_parts.append({"type": "text", "text": (
             f"**CONSULTA:** {state['consulta_texto']}\n\n"
-            f"**HISTORIAL:** {contexto_mem_str[:300]}\n\n"
             f"**TÉRMINOS:** {terminos_str[:300]}\n\n"
             f"**ENTIDADES (grafo):** {entidades_str}\n\n"
             f"**TEMA:** {tema_str}\n\n"
             f"**ANÁLISIS VISUAL USUARIO:**\n{analisis_visual_str[:800]}\n\n"
-            f"**SECCIONES DEL MANUAL (incluyen texto de páginas con imágenes):**\n"
-            f"{state['contexto_documentos']}"
+            f"**SECCIONES DEL MANUAL:**\n{ctx_docs}"
             f"{seccion_comp}{seccion_est}\n\n"
             "Responde EXCLUSIVAMENTE con el contenido del manual e imágenes de referencia."
-        )}]
+        )})
 
         imagen_path = state.get("imagen_path")
         if state.get("tiene_imagen") and imagen_path and os.path.exists(imagen_path):
@@ -2025,10 +2907,10 @@ class AsistenteHistologiaQdrant:
             ])
             if state.get("confianza_baja"):
                 warning = "⚠️ *Nota: Esta respuesta se generó con confianza baja (<71% de coincidencia) en los apuntes, tómalo en cuenta.*"
-                state["respuesta_final"] = (
-                    resp.content if "Hola, ¿en qué te puedo ayudar sobre histología?" in resp.content
-                    else f"{warning}\n\n{resp.content}"
-                )
+                if "Hola, ¿en qué te puedo ayudar sobre histología?" in resp.content:
+                    state["respuesta_final"] = resp.content
+                else:
+                    state["respuesta_final"] = f"{warning}\n\n{resp.content}"
             else:
                 state["respuesta_final"] = resp.content
             print(f"✅ Respuesta: {len(resp.content)} chars")
@@ -2044,6 +2926,7 @@ class AsistenteHistologiaQdrant:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
+        # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
             self.memoria.add_interaction(state["consulta_texto"], state["respuesta_final"])
 
@@ -2056,9 +2939,11 @@ class AsistenteHistologiaQdrant:
                 "estructura_identificada": state.get("estructura_identificada"),
                 "imagenes_recuperadas":    state.get("imagenes_recuperadas", []),
                 "entidades_consulta":      state.get("entidades_consulta", {}),
+                "mostrar_imagenes":        state.get("mostrar_imagenes", False),
+                "imagenes_para_mostrar":   state.get("imagenes_para_mostrar", []),
             }, f, indent=4, ensure_ascii=False)
 
-        print(f"✅ Flujo v5.1 completado en {total}s")
+        print(f"✅ Flujo v4.1 completado en {total}s")
         if state.get("estructura_identificada"):
             print(f"   → Estructura: {state['estructura_identificada']}")
         return state
@@ -2067,33 +2952,24 @@ class AsistenteHistologiaQdrant:
     # Embeddings (Gemini Text)
     # ------------------------------------------------------------------
 
-    def _embed_texto_gemini(self, texto: str) -> List[float]:
+    def _embed_texto(self, texto: str) -> List[float]:
+        # Usa langchain GoogleGenerativeAIEmbeddings
         return embed_query_con_reintento(self.embeddings, texto)
 
+
     # ------------------------------------------------------------------
-    # Indexación en Qdrant — v5.1
-    # NUEVO: upsert_imagen recibe emb_texto (Gemini sobre ocr+texto_pagina)
+    # Indexación en Neo4j
     # ------------------------------------------------------------------
 
     def _leer_pdf(self, path: str) -> str:
         try:
-            doc   = fitz.open(path)
+            doc = fitz.open(path)
             texto = "".join(page.get_text() for page in doc)
             doc.close()
             return texto
         except Exception as e:
             print(f"⚠️ Error leyendo {path}: {e}")
             return ""
-
-    def _leer_pdf_por_pagina(self, path: str) -> List[Tuple[int, str]]:
-        try:
-            doc     = fitz.open(path)
-            paginas = [(i + 1, page.get_text()) for i, page in enumerate(doc)]
-            doc.close()
-            return paginas
-        except Exception as e:
-            print(f"⚠️ Error leyendo {path}: {e}")
-            return []
 
     def _chunks(self, texto: str, size: int = 500) -> List[str]:
         return [texto[i:i+size] for i in range(0, len(texto), size)]
@@ -2112,6 +2988,7 @@ class AsistenteHistologiaQdrant:
             print("⚠️ Contenido base vacío")
             return
         await self.extractor_temario.extraer_temario(self.contenido_base)
+        # Actualizar clasificador semántico con el temario real
         if self.clasificador_semantico:
             self.clasificador_semantico.temario = self.extractor_temario.temas
             print(f"   🔄 Clasificador semántico actualizado con "
@@ -2120,95 +2997,67 @@ class AsistenteHistologiaQdrant:
     async def indexar_en_qdrant(self, directorio_pdfs: str = DIRECTORIO_PDFS,
                                  imagen_files_extra: Optional[List[str]] = None,
                                  forzar: bool = False):
-        # ── Verificar si ya hay datos ──────────────────────────────────
+        # ── Verificar si ya hay datos ────────────────────────────────
         if not forzar:
             try:
-                n_chunks = await self.qdrant_store.contar_chunks()
-                n_imgs   = await self.qdrant_store.contar_imagenes()
+                n_chunks = self.neo4j.client.count(collection_name=COLLECTION_CHUNKS).count
+                n_imgs   = self.neo4j.client.count(collection_name=COLLECTION_IMAGENES).count
                 if n_chunks > 0 and n_imgs > 0:
-                    print(f"✅ Base de datos Qdrant ya poblada "
-                          f"({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
+                    print(f"✅ Base de datos Qdrant ya poblada ({n_chunks} chunks, {n_imgs} imágenes). Saltando indexación.")
                     print("   (Usá --reindex --force para forzar re-indexación)")
                     return
             except Exception as e:
                 print(f"⚠️ No se pudo verificar estado de la BD: {e}")
 
-        # ── PASO 1: Extraer imágenes PRIMERO ──────────────────────────
-        print("📸 Extrayendo imágenes de PDFs...")
-        imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
-
-        from collections import defaultdict
-        mapa_imagenes_pagina: Dict[tuple, List[str]] = defaultdict(list)
-        for img_info in imagenes_pdf:
-            key = (img_info["fuente_pdf"], img_info["pagina"])
-            if os.path.exists(img_info["path"]):   # solo rutas válidas
-                mapa_imagenes_pagina[key].append(img_info["path"])
-        print(f"   📋 Mapa construido: {len(mapa_imagenes_pagina)} páginas con imágenes")
-
-        mapa_texto_pagina: Dict[tuple, str] = {}
-
-        # ── PASO 2: Indexar chunks de texto ───────────────────────────
-        print("📄 Indexando chunks de texto en Qdrant (por página)...")
+        print("📄 Indexando chunks de texto en Neo4j...")
         for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
-            fuente  = os.path.basename(pdf_path)
-            paginas = self._leer_pdf_por_pagina(pdf_path)
-            chunk_global = 0
-            for pagina_num, texto_pagina in paginas:
-                mapa_texto_pagina[(fuente, pagina_num)] = texto_pagina
-                imgs_esta_pagina = mapa_imagenes_pagina.get((fuente, pagina_num), [])
-                chunks_pagina    = self._chunks(texto_pagina)
-                for i, chunk in enumerate(chunks_pagina):
-                    try:
-                        emb       = self._embed_texto_gemini(chunk)
-                        chunk_id  = f"chunk_{fuente}_{pagina_num}_{i}"
-                        entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
-                        await self.qdrant_store.upsert_chunk(
-                            chunk_id=chunk_id, texto=chunk, fuente=fuente,
-                            chunk_idx=chunk_global, pagina=pagina_num,
-                            embedding=emb, entidades=entidades,
-                            imagenes_pagina=imgs_esta_pagina
-                        )
-                        chunk_global += 1
-                    except Exception as e:
-                        print(f"  ⚠️ Chunk p{pagina_num}/{i}: {e}")
-            print(f"  {fuente}: {chunk_global} chunks ({len(paginas)} páginas)")
+            fuente = os.path.basename(pdf_path)
+            await self.neo4j.upsert_pdf(fuente)
+            texto  = self._leer_pdf(pdf_path)
+            chunks = self._chunks(texto)
+            print(f"  {fuente}: {len(chunks)} chunks")
+            for i, chunk in enumerate(chunks):
+                try:
+                    emb       = self._embed_texto(chunk)
+                    chunk_id  = f"chunk_{fuente}_{i}"
+                    entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
+                    await self.neo4j.upsert_chunk(
+                        chunk_id=chunk_id, texto=chunk, fuente=fuente,
+                        chunk_idx=i, embedding=emb, entidades=entidades
+                    )
+                except Exception as e:
+                    print(f"  ⚠️ Chunk {i}: {e}")
 
-        # ── PASO 3: Indexar imágenes con embedding textual ────────────
-        # NUEVO v5.1: calcular emb_texto = Gemini(ocr_text + texto_pagina)
-        print("📸 Indexando imágenes en Qdrant (con texto_emb Gemini)...")
+        print("📸 Indexando imágenes de PDFs en Neo4j...")
+        imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
         for img_info in imagenes_pdf:
             img_path = img_info["path"]
             if not os.path.exists(img_path):
                 continue
             try:
-                emb_u = self.uni.embed_image(img_path)
-                emb_p = self.plip.embed_image(img_path)
-
-                img_id    = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
-                texto_pag = mapa_texto_pagina.get(
-                    (img_info["fuente_pdf"], img_info["pagina"]), ""
-                )
-
-                # Construir texto combinado para el embedding textual de la imagen
-                ocr_text      = img_info.get("ocr_text", "")
-                texto_combined = f"{ocr_text} {texto_pag}".strip()
-
-                # Calcular embedding Gemini del texto combinado
-                emb_t: Optional[List[float]] = None
-                if texto_combined:
-                    try:
-                        emb_t = self._embed_texto_gemini(texto_combined[:2000])
-                    except Exception as e:
-                        print(f"  ⚠️ emb_texto para {img_id}: {e}")
-
-                await self.qdrant_store.upsert_imagen(
+                # Images from PDF extraction are already preprocessed, don't preprocess again
+                emb_u  = self.uni.embed_image(img_path, preprocess=False)
+                emb_p  = self.plip.embed_image(img_path, preprocess=False)
+                
+                img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
+                
+                nombre_archivo = img_info.get("nombre_archivo", os.path.basename(img_path))
+                etiqueta = img_info.get("etiqueta", "")
+                caption = img_info.get("caption", "")
+                
+                # Log de la imagen para trazabilidad
+                print(f"  📷 {nombre_archivo} | Etiqueta: {etiqueta or 'N/A'} | Caption: {len(caption)} chars")
+                
+                await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path,
                     fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
-                    ocr_text=ocr_text,
+                    ocr_text=img_info.get("ocr_text", ""),
+                    texto_pagina=img_info.get("texto_pagina", ""),
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist(),
-                    emb_texto=emb_t,           # NUEVO v5.1
-                    texto_pagina=texto_pag
+                    caption=caption,
+                    nombre_archivo=nombre_archivo,
+                    etiqueta=etiqueta
                 )
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
@@ -2217,30 +3066,25 @@ class AsistenteHistologiaQdrant:
             if not os.path.exists(img_path):
                 continue
             try:
+
                 ocr = ""
                 try:
                     ocr = pytesseract.image_to_string(Image.open(img_path)).strip()
                 except Exception:
                     pass
                 img_id = f"img_extra_{os.path.basename(img_path)}"
-                emb_u  = self.uni.embed_image(img_path)
-                emb_p  = self.plip.embed_image(img_path)
-                emb_t: Optional[List[float]] = None
-                if ocr:
-                    try:
-                        emb_t = self._embed_texto_gemini(ocr[:2000])
-                    except Exception:
-                        pass
-                await self.qdrant_store.upsert_imagen(
+                # Extra images are not preprocessed, apply preprocessing
+                emb_u = self.uni.embed_image(img_path, preprocess=True)
+                emb_p = self.plip.embed_image(img_path, preprocess=True)
+                await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
-                    pagina=0, ocr_text=ocr[:300],
-                    emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist(),
-                    emb_texto=emb_t, texto_pagina=""
+                    pagina=0, ocr_text=ocr[:300], texto_pagina="", emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
                 )
             except Exception as e:
                 print(f"  ❌ Imagen extra {img_path}: {e}")
 
-        print("✅ Indexación Qdrant v5.1 completada")
+        await self.neo4j.crear_relaciones_similitud(SIMILAR_IMG_THRESHOLD)
+        print("✅ Indexación Neo4j completada")
 
     # ------------------------------------------------------------------
     # Punto de entrada público
@@ -2249,21 +3093,24 @@ class AsistenteHistologiaQdrant:
     async def consultar(self, consulta_texto: str,
                          imagen_path: Optional[str] = None,
                          user_id: str = "default_user") -> str:
-        imagen_activa       = imagen_path or self.memoria.get_imagen_activa()
+        """
+        La imagen es completamente opcional en cada llamada.
+        Si no se pasa, el router decide si reutilizar la imagen activa en memoria.
+        """
         tiene_imagen_activa = self.memoria.tiene_imagen_previa() or bool(imagen_path)
 
         print(f"\n{'='*70}")
-        print(f"🔬 RAG Histología Qdrant v5.1 | umbral={self.SIMILARITY_THRESHOLD}")
+        print(f"🔬 RAG Histología Neo4j v4.2 | umbral={self.SIMILARITY_THRESHOLD}")
         print(f"   Texto:         {consulta_texto}")
         print(f"   Imagen turno:  {imagen_path or 'ninguna'}")
-        print(f"   Imagen activa: {imagen_activa or 'ninguna'}")
+        print(f"   Imagen memoria: {self.memoria.get_imagen_activa() or 'ninguna'}")
         print(f"{'='*70}")
 
         initial_state = AgentState(
             messages=[], consulta_texto=consulta_texto,
-            imagen_path=imagen_activa,
-            imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None,
-            contexto_memoria="", contenido_base=self.contenido_base, terminos_busqueda="",
+            imagen_path=imagen_path,
+            imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None, contexto_memoria="",
+            contenido_base=self.contenido_base, terminos_busqueda="",
             entidades_consulta={"tejidos": [], "estructuras": [], "tinciones": []},
             consulta_busqueda_texto="", consulta_busqueda_visual="",
             resultados_busqueda=[], resultados_validos=[], contexto_documentos="",
@@ -2271,19 +3118,22 @@ class AsistenteHistologiaQdrant:
             analisis_visual=None, tiene_imagen=False, imagen_es_nueva=False,
             contexto_suficiente=False, temario=self.extractor_temario.temas,
             tema_valido=True, tema_encontrado=None, imagenes_recuperadas=[],
+            imagenes_texto_map={},
             analisis_comparativo=None, estructura_identificada=None,
             similitud_semantica_dominio=0.0, confianza_baja=False,
+            mostrar_imagenes=False, imagenes_para_mostrar=[],
+            historial_conversacional="",
         )
 
         config = {
             "configurable": {"thread_id": user_id},
-            "run_name":     f"consulta-qdrant-v5.1-{user_id}",
-            "tags":         ["rag", "histologia", "qdrant", "v5.1"],
+            "run_name":     f"consulta-neo4j-v4.1-{user_id}",
+            "tags":         ["rag", "histologia", "neo4j", "imagebind", "v4.1"],
             "metadata": {
                 "tiene_imagen_nueva":  imagen_path is not None,
                 "tiene_imagen_activa": tiene_imagen_activa,
                 "consulta":            consulta_texto[:100],
-                "version":             "5.1"
+                "version":             "4.1"
             }
         }
         try:
@@ -2292,19 +3142,30 @@ class AsistenteHistologiaQdrant:
         except Exception as e:
             import traceback; traceback.print_exc()
             respuesta = f"Error: {e}"
+            final = {}
 
         print(f"\n{'='*70}\n📖 RESPUESTA:\n{'='*70}")
         print(respuesta)
         print("="*70)
+        
+        # Retornar dict con toda la info para el server
+        self._ultimo_resultado = {
+            "respuesta": respuesta,
+            "mostrar_imagenes": final.get("mostrar_imagenes", False),
+            "imagenes_recuperadas": final.get("imagenes_recuperadas", []),
+            "estructura_identificada": final.get("estructura_identificada"),
+            "imagenes_para_mostrar": final.get("imagenes_para_mostrar", []),
+        }
+        
         return respuesta
 
     async def cerrar(self):
-        if self.qdrant_store:
-            await self.qdrant_store.close()
+        if self.neo4j:
+            await self.neo4j.close()
 
 
 # =============================================================================
-# MODO INTERACTIVO
+# MODO INTERACTIVO MEJORADO v4.1
 # =============================================================================
 
 async def modo_interactivo(reindex: bool = False, force: bool = False):
@@ -2318,7 +3179,7 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
     await asistente.extraer_y_preparar_temario()
     print(f"   → {len(asistente.extractor_temario.temas)} temas")
 
-    print("\n💾 Indexando en Qdrant...")
+    print("\n💾 Indexando en Neo4j...")
     if reindex:
         await asistente.indexar_en_qdrant(DIRECTORIO_PDFS, forzar=force)
     else:
@@ -2326,11 +3187,12 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║   RAG Histología Qdrant v5.1 — Chat Interactivo             ║
+║  RAG Histología Neo4j v4.2 — Chat Interactivo               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  • Escribí tu pregunta y presioná Enter                     ║
 ║  • Para subir una imagen: escribí el PATH cuando se pida    ║
 ║  • La imagen se recuerda entre turnos — no es obligatoria   ║
+║  • ✨ Consultas de texto puro — flujo optimizado            ║
 ║  • Comandos especiales:                                     ║
 ║      temario       → ver temas disponibles                  ║
 ║      imagen actual → ver imagen activa en el chat           ║
@@ -2342,6 +3204,7 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
     while True:
         try:
             print("\n" + "─"*60)
+
             img_activa = asistente.memoria.get_imagen_activa()
             if img_activa:
                 print(f"📌 Imagen activa: {os.path.basename(img_activa)} "
@@ -2377,6 +3240,7 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
                 print("🗑️  Imagen activa eliminada. El próximo turno será solo texto.")
                 continue
 
+            # Imagen opcional
             imagen_path = None
             img_input   = input("🖼️  Imagen (path o Enter para omitir): ").strip()
 
@@ -2406,10 +3270,8 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reindex", action="store_true",
-                        help="Indexar en Qdrant (salta si ya hay datos)")
-    parser.add_argument("--force", action="store_true",
-                        help="Forzar re-indexación aunque haya datos")
+    parser.add_argument("--reindex", action="store_true", help="Indexar en Neo4j (salta si ya hay datos)")
+    parser.add_argument("--force", action="store_true", help="Forzar re-indexación aunque haya datos")
     args = parser.parse_args()
 
     import logging

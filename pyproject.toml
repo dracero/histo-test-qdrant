@@ -1,7 +1,7 @@
 [project]
 name = "rag-histologia-qdrant"
 version = "5.0.0"
-description = "RAG Multimodal de Histología con Qdrant"
+description = "RAG Multimodal de Histología con ImageBind + Qdrant"
 requires-python = ">=3.10"
 dependencies = [
     # Qdrant
@@ -12,10 +12,13 @@ dependencies = [
     "langchain-google-genai>=2.0",
     "langchain-core>=0.3",
     "langgraph>=0.2",
+    "langchain-huggingface>=0.1.0",
+    "sentence-transformers>=3.0.0",
     # LangSmith observability
     "langsmith>=0.1",
     # ML / Torch
-    "torch>=2.0",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
     "numpy>=1.24",
     "Pillow>=10.0",
     # Async
@@ -43,9 +46,12 @@ packages = []
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
-[dependency-groups]
-dev = [
-    "hypothesis>=6.151.9",
-    "pytest>=9.0.2",
-    "pytest-asyncio>=1.3.0",
-]
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }
+torchaudio = { index = "pytorch-cu118" }

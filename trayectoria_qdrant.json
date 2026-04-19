@@ -5,10 +5,11 @@
             "tiempo": 0
         },
         {
-            "nodo": "ProcesarImagen",
-            "tiene_imagen": true,
-            "imagen_es_nueva": true,
-            "tiempo": 12.86
+            "nodo": "Router:_route_por_modo",
+            "modo_detectado": "solo_texto",
+            "tiene_imagen_nueva": null,
+            "tiene_imagen_memoria": true,
+            "hace_referencia_imagen": false
         },
         {
             "nodo": "Clasificar",
@@ -16,69 +17,79 @@
             "tema_encontrado": null,
             "entidades": {
                 "tejidos": [
-                    "epitelial"
+                    "sistema nervioso"
                 ],
-                "estructuras": [],
-                "tinciones": [
-                    "hematoxilina y eosina (h&e)"
-                ]
+                "estructuras": [
+                    "neuroglia",
+                    "astrocitos"
+                ],
+                "tinciones": []
             },
-            "similitud_dominio": 0.693669086408519,
+            "similitud_dominio": 0.45930825838315725,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 8.44
+            "tiempo": 1.82
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Cartílago hialino en disco de crecimiento",
-            "tiempo": 2.37
+            "query": "Descripción de neuroglia y sus tipos celulares.",
+            "tiempo": 0.54
         },
         {
-            "nodo": "BuscarQdrant",
-            "hits": 15,
-            "tiempo": 12.75
+            "nodo": "BuscarNeo4j",
+            "hits": 10,
+            "imagenes_para_mostrar": 2,
+            "tiempo": 1.7
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 14,
-            "imgs": 8,
+            "hits_validos": 10,
+            "imgs": 0,
+            "modo": "solo_texto",
             "tiempo": 0.0
-        },
-        {
-            "nodo": "AnalisisComparativo",
-            "refs": 3,
-            "estructura": "Epitelio.",
-            "tiempo": 24.94
         },
         {
             "nodo": "GenerarRespuesta",
             "contexto_suficiente": true,
-            "imagenes_usadas": 3,
-            "tiene_comparativo": true,
-            "tiempo": 27.77
+            "imagenes_usadas": 0,
+            "tiene_comparativo": false,
+            "tiempo": 2.06
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 91.64
+            "tiempo_total": 10.08
         }
     ],
-    "estructura_identificada": "Epitelio.",
-    "imagenes_recuperadas": [
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p4_img4.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p1_img1.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p10_img10.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p34_img37.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p2_img2.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p6_img6.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p5_img5.jpg",
-        "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_p3_img3.jpg"
-    ],
+    "estructura_identificada": null,
+    "imagenes_recuperadas": [],
     "entidades_consulta": {
         "tejidos": [
-            "epitelial"
+            "sistema nervioso"
         ],
-        "estructuras": [],
-        "tinciones": [
-            "hematoxilina y eosina (h&e)"
-        ]
-    }
+        "estructuras": [
+            "neuroglia",
+            "astrocitos"
+        ],
+        "tinciones": []
+    },
+    "mostrar_imagenes": true,
+    "imagenes_para_mostrar": [
+        {
+            "id": "39a3ee3d-c028-5e1d-87a3-380b2bb782e8",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag1.png",
+            "caption": "SGC- MC-ML05\nV. 02\n1/223\nImagen 11.1. Tejido Conectivo Especializado, Cartílago Hialino.\nLaminilla No: \nTráquea 44\nE. S.\nTejido: \nConectivo \nEspecializado\nVariedad: \nCartilaginoso: \nHialino\nEstructura señalada: \nPericondrio: capa fibrosa (fibroblastos,\nfibras de colágena dispuestas \nregularmente) y capa \ncondrógena\n(condroblastos y células condrógenas)",
+            "nombre_archivo": "arch2_pag1.png",
+            "etiqueta": "Imagen 11.1",
+            "fuente": "arch2.pdf",
+            "similitud_semantica": 0.390658155856689
+        },
+        {
+            "id": "68e4e345-c82d-5f62-b13f-e9372888e3e8",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag5.png",
+            "caption": "Imagen 11.5. Tejido Conectivo Especializado, Cartílago Fibroso.\nLaminilla No:\nHueso fractu-\nrado 79. c.\nTejido: \nConectivo \nEspecializado\nVariedad: \nCartílago \nFibroso\nEstructura señalada: \nHileras de condrocitos, fibras de \ncolágena dispuestas \nregularmente",
+            "nombre_archivo": "arch2_pag5.png",
+            "etiqueta": "Imagen 11.5",
+            "fuente": "arch2.pdf",
+            "similitud_semantica": 0.3145531289536825
+        }
+    ]
 }
