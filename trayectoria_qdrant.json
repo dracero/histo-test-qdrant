@@ -6,71 +6,90 @@
         },
         {
             "nodo": "Router:_route_por_modo",
-            "modo_detectado": "con_imagen",
-            "tiene_imagen_nueva": true,
+            "modo_detectado": "solo_texto",
+            "tiene_imagen_nueva": null,
             "tiene_imagen_memoria": true,
-            "hace_referencia_imagen": true
-        },
-        {
-            "nodo": "ProcesarImagen",
-            "tiene_imagen": true,
-            "imagen_es_nueva": true,
-            "tiempo": 3.81
+            "hace_referencia_imagen": false
         },
         {
             "nodo": "Clasificar",
             "tema_valido": true,
             "tema_encontrado": null,
             "entidades": {
-                "tejidos": [],
-                "estructuras": [],
+                "tejidos": [
+                    "tejido nervioso"
+                ],
+                "estructuras": [
+                    "neuronas",
+                    "oligodendrocitos"
+                ],
                 "tinciones": []
             },
-            "similitud_dominio": 0.5850832210177868,
+            "similitud_dominio": 0.4681637740865326,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 1.33
+            "tiempo": 1.89
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Describir tejido nervioso en imagen.",
-            "tiempo": 0.41
+            "query": "Imágenes de neuronas, oligodendrocitos y neuroglia.",
+            "tiempo": 0.3
         },
         {
             "nodo": "BuscarNeo4j",
-            "hits": 10,
-            "imagenes_para_mostrar": 0,
-            "tiempo": 1.61
+            "hits": 15,
+            "imagenes_para_mostrar": 3,
+            "tiempo": 1.95
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 0,
+            "hits_validos": 10,
             "imgs": 0,
-            "modo": "multimodal",
-            "tiempo": 0.0
-        },
-        {
-            "nodo": "AnalisisComparativo",
-            "motivo": "sin referencias",
+            "modo": "solo_texto",
             "tiempo": 0.0
         },
         {
             "nodo": "GenerarRespuesta",
-            "contexto_suficiente": false,
-            "modo": "multimodal",
-            "tiempo": 0.0
+            "contexto_suficiente": true,
+            "imagenes_usadas": 0,
+            "tiene_comparativo": false,
+            "tiempo": 1.13
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 7.18
+            "tiempo_total": 11.53
         }
     ],
     "estructura_identificada": null,
     "imagenes_recuperadas": [],
     "entidades_consulta": {
-        "tejidos": [],
-        "estructuras": [],
+        "tejidos": [
+            "tejido nervioso"
+        ],
+        "estructuras": [
+            "neuronas",
+            "oligodendrocitos"
+        ],
         "tinciones": []
     },
-    "mostrar_imagenes": false,
-    "imagenes_para_mostrar": []
+    "mostrar_imagenes": true,
+    "imagenes_para_mostrar": [
+        {
+            "id": "e79190e2-889b-5b4b-9657-8c32366a50f9",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag33.png",
+            "caption": "Imagen 15.3. Tejido nervioso neuroglia.\nLaminilla No:\n55 Rio Ortega\nTejido:\nNervioso\nVariedad:\nNeuroglia\nEstructura señalada:\nOligodendrocito",
+            "nombre_archivo": "arch2_pag33.png",
+            "etiqueta": "Imagen 15.3",
+            "fuente": "arch2.pdf",
+            "similitud_semantica": 0.95
+        },
+        {
+            "id": "2d0f99a8-9208-5af0-a609-532dd953e928",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag32.png",
+            "caption": "Imagen 15.2. Tejido nervioso neuroglia.\nLaminilla No:\n62 Golgi\nTejido:\nnervioso\nVariedad:\nNeuroglia\nEstructura señalada\nAstrocito fibroso",
+            "nombre_archivo": "arch2_pag32.png",
+            "etiqueta": "Imagen 15.2",
+            "fuente": "arch2.pdf",
+            "similitud_semantica": 0.95
+        }
+    ]
 }

@@ -744,6 +744,108 @@ class QdrantVectorStore:
             print(f"⚠️ Error búsqueda chunks por texto: {e}")
             return []
 
+    async def buscar_imagenes_por_referencia(self, patrones: list, top_k: int = 10) -> list:
+        """Busca imágenes cuya etiqueta, caption o nombre_archivo contenga alguno de los patrones.
+        Equivalente a la query Cypher del repo de referencia (histo-test) que busca
+        nodos :Imagen por etiqueta/caption/nombre_archivo."""
+        import unicodedata
+        if not patrones:
+            return []
+
+        def sin_tildes(s):
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+        patrones_lower = [p.lower() for p in patrones]
+        patrones_sin_tildes = [sin_tildes(p) for p in patrones_lower]
+
+        try:
+            all_imgs, _ = self.client.scroll(
+                collection_name=COLLECTION_IMAGENES,
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            resultados = []
+            vistas = set()
+            for r in all_imgs:
+                etiqueta = (r.payload.get("etiqueta", "") or "").lower()
+                caption = (r.payload.get("caption", "") or "").lower()
+                nombre = (r.payload.get("nombre_archivo", "") or "").lower()
+                combined = f"{etiqueta} {caption} {nombre}"
+                combined_sin_tildes = sin_tildes(combined)
+
+                if "_full." in nombre:
+                    continue
+
+                matched = any(
+                    p in combined or p_st in combined_sin_tildes
+                    for p, p_st in zip(patrones_lower, patrones_sin_tildes)
+                )
+                if not matched:
+                    continue
+
+                img_path = r.payload.get("path", "")
+                if not img_path or not os.path.exists(img_path):
+                    continue
+                if img_path in vistas:
+                    continue
+                vistas.add(img_path)
+
+                texto_desc = caption if caption.strip() else r.payload.get("texto_pagina", "") or ""
+                resultados.append({
+                    "id": str(r.id),
+                    "texto": texto_desc,
+                    "fuente": r.payload.get("fuente", ""),
+                    "tipo": "imagen",
+                    "imagen_path": img_path,
+                    "similitud": 0.95,
+                    "nombre_archivo": r.payload.get("nombre_archivo", ""),
+                    "etiqueta": r.payload.get("etiqueta", ""),
+                    "caption_raw": r.payload.get("caption", ""),
+                    "origen": "referencia_respuesta",
+                })
+
+            if resultados:
+                print(f"   🖼️ {len(resultados)} imágenes encontradas por referencia en respuesta")
+            return resultados[:top_k]
+        except Exception as e:
+            print(f"⚠️ Error búsqueda imágenes por referencia: {e}")
+            return []
+
+    def extraer_imagenes_de_resultados(self, resultados: list, top_k: int = 5) -> list:
+        """Extrae y valida imágenes desde resultados de búsqueda.
+        Filtra resultados de tipo 'imagen', valida path en disco,
+        transforma formato y limita a top_k."""
+        imagenes = [r for r in resultados if r.get("tipo") == "imagen"]
+        if not imagenes:
+            return []
+
+        imagenes_validas = []
+        vistas = set()
+        for img in imagenes:
+            img_path = img.get("imagen_path", "")
+            if not img_path or not os.path.exists(img_path):
+                continue
+            nombre = os.path.basename(img_path).lower()
+            if "_full." in nombre:
+                continue
+            if img_path in vistas:
+                continue
+            vistas.add(img_path)
+
+            caption = img.get("caption_raw") or img.get("texto", "") or ""
+            imagenes_validas.append({
+                "id": img.get("id", ""),
+                "path": img_path,
+                "caption": caption[:500],
+                "nombre_archivo": img.get("nombre_archivo", os.path.basename(img_path)),
+                "etiqueta": img.get("etiqueta", ""),
+                "fuente": img.get("fuente", ""),
+                "similitud_semantica": img.get("similitud", 0),
+            })
+
+        return imagenes_validas[:top_k]
+
     async def busqueda_imagenes_semantica(self, texto_embedding: list, entidades: dict,
                                           embeddings_model, top_k: int = 5) -> list:
         import numpy as np
@@ -1956,19 +2058,27 @@ class AsistenteHistologiaQdrant:
             if not necesita:
                 return consulta
             
-            # Paso 2: Reescribir
+            # Paso 2: Reescribir — SOLO resolver anáforas, no generar contenido
             resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=(
                     "Reescribí la siguiente consulta del usuario para que sea autocontenida, "
-                    "resolviendo cualquier referencia a temas previos usando el historial. "
-                    "Devolvé SOLO la consulta reescrita, sin explicaciones."
+                    "resolviendo cualquier referencia a temas previos usando el historial.\n\n"
+                    "REGLAS ESTRICTAS:\n"
+                    "- Devolvé SOLO la consulta reescrita, sin explicaciones.\n"
+                    "- La consulta reescrita debe ser UNA SOLA ORACIÓN CORTA (máximo 30 palabras).\n"
+                    "- NO generes respuestas, NO describas imágenes, NO inventes contenido.\n"
+                    "- Solo reemplazá pronombres y referencias por los términos concretos del historial.\n"
+                    "- Si la consulta ya es clara por sí sola, devolvela tal cual."
                 )),
                 HumanMessage(content=f"HISTORIAL:\n{historial}\n\nCONSULTA ACTUAL: {consulta}")
             ])
             reescrita = resp.content.strip()
-            if reescrita:
+            # Validación: si la reescritura es demasiado larga, es una alucinación
+            if reescrita and len(reescrita) < len(consulta) * 3 and len(reescrita) < 200:
                 print(f"   🔄 Consulta reescrita: '{consulta}' → '{reescrita}'")
                 return reescrita
+            elif reescrita and len(reescrita) >= 200:
+                print(f"   ⚠️ Reescritura descartada (demasiado larga: {len(reescrita)} chars)")
             return consulta
         except Exception as e:
             print(f"   ⚠️ Error reescribiendo consulta: {e}")
@@ -2881,22 +2991,26 @@ class AsistenteHistologiaQdrant:
                 print(f"   ⚠️ No se pudo añadir imagen usuario: {e}")
 
         imagenes_usadas = 0
-        for img_path in state.get("imagenes_recuperadas", [])[:3]:
-            if not os.path.exists(img_path):
-                continue
-            try:
-                with open(img_path, "rb") as f:
-                    data = base64.b64encode(f.read()).decode("utf-8")
-                ext    = os.path.splitext(img_path)[1].lower()
-                mime   = "image/png" if ext == ".png" else "image/jpeg"
-                nombre = os.path.basename(img_path)
-                content_parts.append({"type": "text",
-                                       "text": f"\n**REFERENCIA [Imagen: {nombre}]:**"})
-                content_parts.append({"type": "image_url",
-                                       "image_url": {"url": f"data:{mime};base64,{data}"}})
-                imagenes_usadas += 1
-            except Exception as e:
-                print(f"   ⚠️ {img_path}: {e}")
+        # Solo enviar imágenes al LLM si el usuario subió una imagen (modo multimodal)
+        # En modo solo texto, el LLM referencia imágenes por etiqueta ("Imagen 15.1")
+        # desde el texto de los chunks, y _nodo_finalizar las busca en Qdrant
+        if not es_solo_texto:
+            for img_path in state.get("imagenes_recuperadas", [])[:3]:
+                if not os.path.exists(img_path):
+                    continue
+                try:
+                    with open(img_path, "rb") as f:
+                        data = base64.b64encode(f.read()).decode("utf-8")
+                    ext    = os.path.splitext(img_path)[1].lower()
+                    mime   = "image/png" if ext == ".png" else "image/jpeg"
+                    nombre = os.path.basename(img_path)
+                    content_parts.append({"type": "text",
+                                           "text": f"\n**REFERENCIA [Imagen: {nombre}]:**"})
+                    content_parts.append({"type": "image_url",
+                                           "image_url": {"url": f"data:{mime};base64,{data}"}})
+                    imagenes_usadas += 1
+                except Exception as e:
+                    print(f"   ⚠️ {img_path}: {e}")
 
         print(f"   📊 {1 if state.get('tiene_imagen') else 0} usuario + {imagenes_usadas} manual")
 
@@ -2926,6 +3040,115 @@ class AsistenteHistologiaQdrant:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
+        # ── Post-procesamiento: extraer imágenes referenciadas en la respuesta ──
+        # Solo buscar imágenes si el usuario las pidió explícitamente
+        respuesta = state.get("respuesta_final", "")
+        usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
+
+        if respuesta and usuario_pidio_imagenes:
+            # Capturar múltiples formatos de referencia a imágenes:
+            # "Imagen 15.1", "Imagen 15.1:", "imagen 3.2", "Fig 3A", "Figura 5.1"
+            # IMPORTANTE: Solo capturar etiquetas con formato X.Y (ej: 11.1, 12.5)
+            # para evitar falsos positivos con números sueltos como "1", "2", "3"
+            etiquetas_mencionadas = re.findall(
+                r'(?:[Ii]magen|[Ff]ig(?:ura)?)\s+(\d+\.\d+[A-Za-z]?)', respuesta
+            )
+            print(f"   🔍 DEBUG finalizar: etiquetas encontradas en respuesta = {etiquetas_mencionadas}")
+
+            if etiquetas_mencionadas:
+                etiquetas_unicas = list(dict.fromkeys(etiquetas_mencionadas))
+                print(f"   🖼️ Imágenes referenciadas en respuesta: {['Imagen ' + e for e in etiquetas_unicas]}")
+
+                try:
+                    # Construir patrones de búsqueda amplios
+                    patrones = []
+                    for e in etiquetas_unicas:
+                        patrones.append(f"Imagen {e}")
+                        patrones.append(f"Fig {e}")
+                        patrones.append(f"Figura {e}")
+                        patrones.append(e)  # solo el número "15.1"
+                        # Variante con espacio antes del decimal (ej: "13. 4" en vez de "13.4")
+                        if '.' in e:
+                            parts = e.split('.', 1)
+                            spaced = f"{parts[0]}. {parts[1]}"
+                            patrones.append(f"Imagen {spaced}")
+                            patrones.append(spaced)
+
+                    print(f"   🔍 DEBUG: Buscando patrones: {patrones[:8]}...")
+
+                    # Buscar imágenes en Qdrant por etiqueta/caption/nombre_archivo
+                    imgs_referenciadas = await self.neo4j.buscar_imagenes_por_referencia(
+                        patrones=patrones, top_k=10
+                    )
+                    print(f"   🔍 DEBUG: Qdrant devolvió {len(imgs_referenciadas)} imágenes")
+
+                    if imgs_referenciadas:
+                        # Ordenar según orden de mención en la respuesta
+                        orden_mencion = {}
+                        for i, e in enumerate(etiquetas_unicas):
+                            for fmt in [f"Imagen {e}", f"Fig {e}", f"Figura {e}", e]:
+                                orden_mencion[fmt.lower()] = i
+
+                        def orden_img(img):
+                            etiq = (img.get("etiqueta", "") or "").lower()
+                            nombre = (img.get("nombre_archivo", "") or "").lower()
+                            caption = (img.get("caption_raw", "") or img.get("texto", "") or "").lower()
+                            combined = f"{etiq} {nombre} {caption}"
+                            for patron, idx in orden_mencion.items():
+                                if patron in combined:
+                                    return idx
+                            return 999
+
+                        imgs_referenciadas.sort(key=orden_img)
+
+                        # Extraer y validar imágenes
+                        imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
+                            resultados=imgs_referenciadas,
+                            top_k=len(imgs_referenciadas)
+                        )
+                        if imgs_para_mostrar:
+                            state["imagenes_para_mostrar"] = imgs_para_mostrar
+                            state["mostrar_imagenes"] = True
+                            print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por referencia en respuesta")
+                            for img in imgs_para_mostrar:
+                                print(f"      → {img.get('etiqueta', '')} | {img.get('nombre_archivo', '')}")
+                        else:
+                            print("   ⚠️ Imágenes referenciadas no encontradas en disco")
+                    else:
+                        # Diagnóstico: mostrar qué etiquetas existen en Qdrant
+                        print("   ⚠️ No se encontraron imágenes para las etiquetas mencionadas")
+                        try:
+                            all_imgs, _ = self.neo4j.client.scroll(
+                                collection_name=COLLECTION_IMAGENES,
+                                limit=20,
+                                with_payload=True,
+                                with_vectors=False,
+                            )
+                            etiquetas_existentes = [
+                                r.payload.get("etiqueta", "") for r in all_imgs
+                                if r.payload.get("etiqueta")
+                            ]
+                            if etiquetas_existentes:
+                                print(f"   🔍 DEBUG: Etiquetas existentes en Qdrant ({len(etiquetas_existentes)}):")
+                                for et in etiquetas_existentes[:10]:
+                                    print(f"      → '{et}'")
+                            else:
+                                captions_existentes = [
+                                    r.payload.get("caption", "")[:80] for r in all_imgs
+                                    if r.payload.get("caption")
+                                ]
+                                if captions_existentes:
+                                    print(f"   🔍 DEBUG: No hay etiquetas, pero hay captions ({len(captions_existentes)}):")
+                                    for c in captions_existentes[:5]:
+                                        print(f"      → '{c}'")
+                                else:
+                                    print("   🔍 DEBUG: No hay etiquetas ni captions en imágenes")
+                        except Exception as de:
+                            print(f"   🔍 DEBUG error: {de}")
+
+                except Exception as e:
+                    print(f"   ⚠️ Error buscando imágenes por referencia: {e}")
+
         # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
             self.memoria.add_interaction(state["consulta_texto"], state["respuesta_final"])
