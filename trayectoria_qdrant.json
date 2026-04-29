@@ -16,29 +16,24 @@
             "tema_valido": true,
             "tema_encontrado": null,
             "entidades": {
-                "tejidos": [
-                    "tejido nervioso"
-                ],
-                "estructuras": [
-                    "neuronas",
-                    "oligodendrocitos"
-                ],
+                "tejidos": [],
+                "estructuras": [],
                 "tinciones": []
             },
-            "similitud_dominio": 0.4681637740865326,
+            "similitud_dominio": 0.5975801958229574,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 1.89
+            "tiempo": 2.18
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Imágenes de neuronas, oligodendrocitos y neuroglia.",
-            "tiempo": 0.3
+            "query": "Imágenes de Espermatogonia B histología.",
+            "tiempo": 0.47
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 15,
             "imagenes_para_mostrar": 3,
-            "tiempo": 1.95
+            "tiempo": 2.39
         },
         {
             "nodo": "FiltrarContexto",
@@ -52,44 +47,48 @@
             "contexto_suficiente": true,
             "imagenes_usadas": 0,
             "tiene_comparativo": false,
-            "tiempo": 1.13
+            "tiempo": 1.39
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 11.53
+            "tiempo_total": 6.95
         }
     ],
     "estructura_identificada": null,
     "imagenes_recuperadas": [],
     "entidades_consulta": {
-        "tejidos": [
-            "tejido nervioso"
-        ],
-        "estructuras": [
-            "neuronas",
-            "oligodendrocitos"
-        ],
+        "tejidos": [],
+        "estructuras": [],
         "tinciones": []
     },
     "mostrar_imagenes": true,
     "imagenes_para_mostrar": [
         {
-            "id": "e79190e2-889b-5b4b-9657-8c32366a50f9",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag33.png",
-            "caption": "Imagen 15.3. Tejido nervioso neuroglia.\nLaminilla No:\n55 Rio Ortega\nTejido:\nNervioso\nVariedad:\nNeuroglia\nEstructura señalada:\nOligodendrocito",
-            "nombre_archivo": "arch2_pag33.png",
-            "etiqueta": "Imagen 15.3",
-            "fuente": "arch2.pdf",
-            "similitud_semantica": 0.95
+            "id": "402019b6-2dc5-5239-9b55-8788784cf18f",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch4_pag7.png",
+            "caption": "Imagen 14: Espermatogonia B",
+            "nombre_archivo": "arch4_pag7.png",
+            "etiqueta": "Imagen 14",
+            "fuente": "arch4.pdf",
+            "similitud_semantica": 0.7204977622880996
         },
         {
-            "id": "2d0f99a8-9208-5af0-a609-532dd953e928",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch2_pag32.png",
-            "caption": "Imagen 15.2. Tejido nervioso neuroglia.\nLaminilla No:\n62 Golgi\nTejido:\nnervioso\nVariedad:\nNeuroglia\nEstructura señalada\nAstrocito fibroso",
-            "nombre_archivo": "arch2_pag32.png",
-            "etiqueta": "Imagen 15.2",
-            "fuente": "arch2.pdf",
-            "similitud_semantica": 0.95
+            "id": "344078f1-7fc8-51a5-a5b8-4f63963cf305",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch4_pag5.png",
+            "caption": "Imagen 12: Espermatogonia A clara",
+            "nombre_archivo": "arch4_pag5.png",
+            "etiqueta": "Imagen 12",
+            "fuente": "arch4.pdf",
+            "similitud_semantica": 0.6618272835003738
+        },
+        {
+            "id": "6fb48b43-68eb-55bd-a32f-92caca51ef7a",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch4_pag8.png",
+            "caption": "Imagen 15: Espermatocito",
+            "nombre_archivo": "arch4_pag8.png",
+            "etiqueta": "Imagen 15",
+            "fuente": "arch4.pdf",
+            "similitud_semantica": 0.6518142065996537
         }
     ]
 }

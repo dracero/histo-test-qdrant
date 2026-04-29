@@ -906,17 +906,14 @@ class QdrantVectorStore:
         if resultados_rankeados:
             top3 = [(r["nombre_archivo"], round(r["similitud_semantica"], 3)) for r in resultados_rankeados[:3]]
             print(f"   📊 Re-ranking top-3 sim: {top3}")
-        # Umbral reducido a 0.30: los embeddings de texto 384d tienen similitudes
-        # cross-modal (query→caption) naturalmente más bajas que en indexación directa.
-        # Tomamos los top_k mejores siempre que superen 0.30, garantizando al menos 1
-        # resultado si alguno supera ese umbral mínimo.
-        filtrados = [r for r in resultados_rankeados if r["similitud_semantica"] >= 0.30]
-        if not filtrados and resultados_rankeados:
-            # Fallback: si ninguno supera 0.30, devolvemos el mejor candidato si supera 0.20
-            mejor = resultados_rankeados[0]
-            if mejor["similitud_semantica"] >= 0.20:
-                print(f"   ⚡ Fallback: mejor candidato sim={mejor['similitud_semantica']:.3f}")
-                filtrados = [mejor]
+        # Umbral de similitud semántica: 0.45 para garantizar relevancia.
+        # Solo mostramos imágenes que realmente coincidan con la consulta.
+        UMBRAL_SIMILITUD_IMG = 0.45
+        filtrados = [r for r in resultados_rankeados if r["similitud_semantica"] >= UMBRAL_SIMILITUD_IMG]
+        if filtrados:
+            print(f"   ✅ {len(filtrados)} imágenes con similitud semántica >= {UMBRAL_SIMILITUD_IMG}")
+        else:
+            print(f"   ⚠️ Ninguna imagen superó el umbral de similitud semántica ({UMBRAL_SIMILITUD_IMG})")
         return filtrados[:top_k]
 
     async def busqueda_hibrida(self, texto_embedding, imagen_embedding_uni, imagen_embedding_plip, entidades, top_k=10):
@@ -2493,48 +2490,23 @@ class AsistenteHistologiaQdrant:
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
 
-        # --- Imágenes para mostrar: prioridad a las vinculadas por los chunks ---
+        # --- Imágenes para mostrar: búsqueda semántica contra captions ---
+        # Cuando el usuario pide imágenes, buscamos las que mejor coincidan
+        # semánticamente con su consulta. Máximo 3, con umbral de similitud.
         if state.get("mostrar_imagenes", False):
-            print("   🖼️ Extrayendo imágenes desde chunks recuperados...")
-            imgs_desde_chunks = []
-            vistas_chunks = set()
-
-            # Fuente primaria: imágenes_pagina de los chunks de texto (relación directa PDF)
-            for r in resultados:
-                if r.get("tipo") != "texto":
-                    continue
-                for img_path in r.get("imagenes_pagina", []):
-                    if img_path and os.path.exists(img_path) and img_path not in vistas_chunks:
-                        nombre = os.path.basename(img_path).lower()
-                        if "_full." in nombre:
-                            continue
-                        vistas_chunks.add(img_path)
-                        imgs_desde_chunks.append({
-                            "id": img_path,
-                            "path": img_path,
-                            "nombre_archivo": os.path.basename(img_path),
-                            "caption": r.get("texto", "")[:300],
-                            "etiqueta": "",
-                            "fuente": r.get("fuente", ""),
-                            "similitud_semantica": r.get("similitud", 0.5),
-                        })
-
-            if imgs_desde_chunks:
-                imgs_para_mostrar = imgs_desde_chunks[:3]
-                print(f"   ✅ {len(imgs_para_mostrar)} imágenes extraídas de chunks (fuente directa)")
+            print("   🖼️ Búsqueda semántica de imágenes para mostrar...")
+            imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
+                texto_embedding=state.get("texto_embedding", []),
+                entidades=entidades,
+                embeddings_model=self.embeddings,
+                top_k=3
+            )
+            if imgs_para_mostrar:
+                print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por similitud semántica")
+                for img in imgs_para_mostrar:
+                    print(f"      → {img.get('etiqueta', '')} | {img.get('nombre_archivo', '')} | sim={img.get('similitud_semantica', 0):.3f}")
             else:
-                # Fallback: búsqueda semántica independiente
-                print("   🔎 Sin imágenes en chunks — búsqueda semántica de imágenes...")
-                imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
-                    texto_embedding=state.get("texto_embedding", []),
-                    entidades=entidades,
-                    embeddings_model=self.embeddings,
-                    top_k=3
-                )
-                if imgs_para_mostrar:
-                    print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por búsqueda semántica")
-                else:
-                    print("   ⚠️ No se encontraron imágenes relevantes para mostrar")
+                print("   ⚠️ No se encontraron imágenes con similitud semántica suficiente")
 
             state["imagenes_para_mostrar"] = imgs_para_mostrar
             if imgs_para_mostrar and not state.get("contexto_suficiente"):
@@ -2761,6 +2733,26 @@ class AsistenteHistologiaQdrant:
         except Exception:
             return None
 
+    async def _buscar_metadata_imagen(self, nombre_archivo: str) -> dict:
+        """Busca metadata (etiqueta, caption, fuente) de una imagen en Qdrant por nombre de archivo."""
+        try:
+            all_imgs, _ = self.neo4j.client.scroll(
+                collection_name=COLLECTION_IMAGENES,
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for r in all_imgs:
+                nombre_en_bd = (r.payload.get("nombre_archivo", "") or "").lower()
+                if nombre_archivo.lower() in nombre_en_bd or nombre_en_bd in nombre_archivo.lower():
+                    return {
+                        "etiqueta": r.payload.get("etiqueta", ""),
+                        "caption": r.payload.get("caption", ""),
+                        "fuente": r.payload.get("fuente", ""),
+                    }
+        except Exception as e:
+            print(f"   ⚠️ Error buscando metadata de {nombre_archivo}: {e}")
+        return {"etiqueta": "", "caption": "", "fuente": ""}
 
     async def _nodo_generar_respuesta(self, state: AgentState) -> AgentState:
         t0 = time.time()
@@ -2893,6 +2885,24 @@ class AsistenteHistologiaQdrant:
             )
 
         # ── System prompt diferenciado según modo ──────────────────────
+        # Construir ontología disponible para inyectar en el prompt
+        temario = state.get("temario", [])
+        ontologia_str = ""
+        if temario:
+            temas_muestra = temario[:40]
+            ontologia_str = (
+                "\nONTOLOGÍA DISPONIBLE (temas del manual):\n"
+                + "\n".join(f"  • {t}" for t in temas_muestra)
+            )
+            if len(temario) > 40:
+                ontologia_str += f"\n  ... y {len(temario) - 40} temas más."
+            ontologia_str += (
+                "\n\nIMPORTANTE: Si la consulta del usuario trata sobre un tema que NO está "
+                "en esta ontología y NO aparece en las SECCIONES DEL MANUAL proporcionadas, "
+                "indicá claramente que ese tema no está disponible en el manual actual. "
+                "NO inventes contenido sobre temas fuera de la ontología.\n"
+            )
+
         if es_solo_texto:
             system_prompt = (
                 "Eres un asistente experto de histología. Respondés consultas de texto "
@@ -2902,7 +2912,10 @@ class AsistenteHistologiaQdrant:
                 "2. CITAS: Citá las fuentes con [Manual: archivo].\n"
                 "3. NO inventes información que no esté en las secciones proporcionadas.\n"
                 "4. Si la información es parcial, indicá qué partes provienen del manual y cuáles no están disponibles.\n"
-                "5. No diagnósticos clínicos salvo que estén explícitos en el manual.\n\n"
+                "5. Si el tema consultado NO aparece en las secciones del manual ni en la ontología, "
+                   "respondé: 'Este tema no se encuentra en el manual disponible actualmente.'\n"
+                "6. No diagnósticos clínicos salvo que estén explícitos en el manual.\n\n"
+                f"{ontologia_str}\n"
                 f"{instruccion_prosa}"
                 f"{instruccion_continuidad}"
                 f"{instruccion_imagenes}"
@@ -2935,7 +2948,10 @@ class AsistenteHistologiaQdrant:
                 "3. Para cada 'IMAGEN DE REFERENCIA', indica el nombre y la descripción textual del manual.\n"
                 "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
                    "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
-                "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+                "5. Si el tema NO aparece en las secciones del manual ni en la ontología, "
+                   "indicá que no está disponible en el manual actual.\n"
+                "6. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+                f"{ontologia_str}\n"
                 f"{instruccion_estructura}"
                 f"{instruccion_prosa}"
                 f"{instruccion_continuidad}"
@@ -3040,115 +3056,6 @@ class AsistenteHistologiaQdrant:
         return state
 
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
-        # ── Post-procesamiento: extraer imágenes referenciadas en la respuesta ──
-        # Solo buscar imágenes si el usuario las pidió explícitamente
-        respuesta = state.get("respuesta_final", "")
-        usuario_pidio_imagenes = state.get("mostrar_imagenes", False)
-
-        if respuesta and usuario_pidio_imagenes:
-            # Capturar múltiples formatos de referencia a imágenes:
-            # "Imagen 15.1", "Imagen 15.1:", "imagen 3.2", "Fig 3A", "Figura 5.1"
-            # IMPORTANTE: Solo capturar etiquetas con formato X.Y (ej: 11.1, 12.5)
-            # para evitar falsos positivos con números sueltos como "1", "2", "3"
-            etiquetas_mencionadas = re.findall(
-                r'(?:[Ii]magen|[Ff]ig(?:ura)?)\s+(\d+\.\d+[A-Za-z]?)', respuesta
-            )
-            print(f"   🔍 DEBUG finalizar: etiquetas encontradas en respuesta = {etiquetas_mencionadas}")
-
-            if etiquetas_mencionadas:
-                etiquetas_unicas = list(dict.fromkeys(etiquetas_mencionadas))
-                print(f"   🖼️ Imágenes referenciadas en respuesta: {['Imagen ' + e for e in etiquetas_unicas]}")
-
-                try:
-                    # Construir patrones de búsqueda amplios
-                    patrones = []
-                    for e in etiquetas_unicas:
-                        patrones.append(f"Imagen {e}")
-                        patrones.append(f"Fig {e}")
-                        patrones.append(f"Figura {e}")
-                        patrones.append(e)  # solo el número "15.1"
-                        # Variante con espacio antes del decimal (ej: "13. 4" en vez de "13.4")
-                        if '.' in e:
-                            parts = e.split('.', 1)
-                            spaced = f"{parts[0]}. {parts[1]}"
-                            patrones.append(f"Imagen {spaced}")
-                            patrones.append(spaced)
-
-                    print(f"   🔍 DEBUG: Buscando patrones: {patrones[:8]}...")
-
-                    # Buscar imágenes en Qdrant por etiqueta/caption/nombre_archivo
-                    imgs_referenciadas = await self.neo4j.buscar_imagenes_por_referencia(
-                        patrones=patrones, top_k=10
-                    )
-                    print(f"   🔍 DEBUG: Qdrant devolvió {len(imgs_referenciadas)} imágenes")
-
-                    if imgs_referenciadas:
-                        # Ordenar según orden de mención en la respuesta
-                        orden_mencion = {}
-                        for i, e in enumerate(etiquetas_unicas):
-                            for fmt in [f"Imagen {e}", f"Fig {e}", f"Figura {e}", e]:
-                                orden_mencion[fmt.lower()] = i
-
-                        def orden_img(img):
-                            etiq = (img.get("etiqueta", "") or "").lower()
-                            nombre = (img.get("nombre_archivo", "") or "").lower()
-                            caption = (img.get("caption_raw", "") or img.get("texto", "") or "").lower()
-                            combined = f"{etiq} {nombre} {caption}"
-                            for patron, idx in orden_mencion.items():
-                                if patron in combined:
-                                    return idx
-                            return 999
-
-                        imgs_referenciadas.sort(key=orden_img)
-
-                        # Extraer y validar imágenes
-                        imgs_para_mostrar = self.neo4j.extraer_imagenes_de_resultados(
-                            resultados=imgs_referenciadas,
-                            top_k=len(imgs_referenciadas)
-                        )
-                        if imgs_para_mostrar:
-                            state["imagenes_para_mostrar"] = imgs_para_mostrar
-                            state["mostrar_imagenes"] = True
-                            print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas por referencia en respuesta")
-                            for img in imgs_para_mostrar:
-                                print(f"      → {img.get('etiqueta', '')} | {img.get('nombre_archivo', '')}")
-                        else:
-                            print("   ⚠️ Imágenes referenciadas no encontradas en disco")
-                    else:
-                        # Diagnóstico: mostrar qué etiquetas existen en Qdrant
-                        print("   ⚠️ No se encontraron imágenes para las etiquetas mencionadas")
-                        try:
-                            all_imgs, _ = self.neo4j.client.scroll(
-                                collection_name=COLLECTION_IMAGENES,
-                                limit=20,
-                                with_payload=True,
-                                with_vectors=False,
-                            )
-                            etiquetas_existentes = [
-                                r.payload.get("etiqueta", "") for r in all_imgs
-                                if r.payload.get("etiqueta")
-                            ]
-                            if etiquetas_existentes:
-                                print(f"   🔍 DEBUG: Etiquetas existentes en Qdrant ({len(etiquetas_existentes)}):")
-                                for et in etiquetas_existentes[:10]:
-                                    print(f"      → '{et}'")
-                            else:
-                                captions_existentes = [
-                                    r.payload.get("caption", "")[:80] for r in all_imgs
-                                    if r.payload.get("caption")
-                                ]
-                                if captions_existentes:
-                                    print(f"   🔍 DEBUG: No hay etiquetas, pero hay captions ({len(captions_existentes)}):")
-                                    for c in captions_existentes[:5]:
-                                        print(f"      → '{c}'")
-                                else:
-                                    print("   🔍 DEBUG: No hay etiquetas ni captions en imágenes")
-                        except Exception as de:
-                            print(f"   🔍 DEBUG error: {de}")
-
-                except Exception as e:
-                    print(f"   ⚠️ Error buscando imágenes por referencia: {e}")
-
         # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
             self.memoria.add_interaction(state["consulta_texto"], state["respuesta_final"])
@@ -3166,7 +3073,7 @@ class AsistenteHistologiaQdrant:
                 "imagenes_para_mostrar":   state.get("imagenes_para_mostrar", []),
             }, f, indent=4, ensure_ascii=False)
 
-        print(f"✅ Flujo v4.1 completado en {total}s")
+        print(f"✅ Flujo v4.2 completado en {total}s")
         if state.get("estructura_identificada"):
             print(f"   → Estructura: {state['estructura_identificada']}")
         return state
