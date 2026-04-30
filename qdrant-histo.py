@@ -883,18 +883,29 @@ class QdrantVectorStore:
         q_emb = np.array(texto_embedding)
         
         for img_id, img_dict in candidatas.items():
-            caption = img_dict.get("texto", "") or img_dict.get("caption_raw", "")
-            if not caption or len(caption.strip()) < 10: continue
+            caption_full = img_dict.get("texto", "") or img_dict.get("caption_raw", "")
+            if not caption_full or len(caption_full.strip()) < 10: continue
             img_path = img_dict.get("imagen_path", "")
             nombre_archivo = img_dict.get("nombre_archivo", "").lower()
             if not img_path or not os.path.exists(img_path) or "_full." in nombre_archivo: continue
             
             try:
-                caption_emb = np.array(embed_query_con_reintento(embeddings_model, caption[:500]))
-                sim = float(q_emb @ caption_emb / (np.linalg.norm(q_emb) * np.linalg.norm(caption_emb) + 1e-10))
+                # Similaridad con caption completo
+                caption_emb = np.array(embed_query_con_reintento(embeddings_model, caption_full[:500]))
+                sim_caption = float(q_emb @ caption_emb / (np.linalg.norm(q_emb) * np.linalg.norm(caption_emb) + 1e-10))
+                
+                # Similaridad con título (primera línea del caption = señal más fuerte)
+                titulo = caption_full.split('\n')[0].strip() if caption_full else ""
+                sim_titulo = 0.0
+                if titulo and len(titulo) >= 5:
+                    titulo_emb = np.array(embed_query_con_reintento(embeddings_model, titulo))
+                    sim_titulo = float(q_emb @ titulo_emb / (np.linalg.norm(q_emb) * np.linalg.norm(titulo_emb) + 1e-10))
+                
+                # Score final: priorizar la señal más fuerte (título o caption)
+                sim = max(sim_titulo, sim_caption) * 0.7 + min(sim_titulo, sim_caption) * 0.3
                 
                 resultados_rankeados.append({
-                    "id": img_id, "path": img_path, "caption": caption[:500],
+                    "id": img_id, "path": img_path, "caption": caption_full[:500],
                     "nombre_archivo": img_dict.get("nombre_archivo", os.path.basename(img_path)),
                     "etiqueta": img_dict.get("etiqueta", ""), "fuente": img_dict.get("fuente", ""),
                     "similitud_semantica": sim
@@ -2508,6 +2519,32 @@ class AsistenteHistologiaQdrant:
             else:
                 print("   ⚠️ No se encontraron imágenes con similitud semántica suficiente")
 
+            # Fallback: búsqueda por keywords en etiquetas/captions
+            # Si la búsqueda semántica no encontró suficientes imágenes, buscar por texto exacto
+            if not imgs_para_mostrar or len(imgs_para_mostrar) < 2:
+                print("   🔤 Fallback: búsqueda por keywords en etiquetas/captions...")
+                imgs_keyword = await self.neo4j.buscar_imagenes_por_referencia(
+                    patrones=palabras_consulta, top_k=3
+                )
+                if imgs_keyword:
+                    paths_ya = {img.get("path", "") for img in imgs_para_mostrar}
+                    for img_kw in imgs_keyword:
+                        kw_path = img_kw.get("imagen_path", "")
+                        if kw_path and kw_path not in paths_ya:
+                            imgs_para_mostrar.append({
+                                "id": img_kw.get("id", ""),
+                                "path": kw_path,
+                                "caption": img_kw.get("caption_raw", img_kw.get("texto", ""))[:500],
+                                "nombre_archivo": img_kw.get("nombre_archivo", os.path.basename(kw_path)),
+                                "etiqueta": img_kw.get("etiqueta", ""),
+                                "fuente": img_kw.get("fuente", ""),
+                                "similitud_semantica": 0.90,
+                            })
+                            paths_ya.add(kw_path)
+                    if len(imgs_para_mostrar) > 3:
+                        imgs_para_mostrar = imgs_para_mostrar[:3]
+                    print(f"   📋 Total imágenes tras fallback keywords: {len(imgs_para_mostrar)}")
+
             state["imagenes_para_mostrar"] = imgs_para_mostrar
             if imgs_para_mostrar and not state.get("contexto_suficiente"):
                 state["contexto_suficiente"] = True
@@ -3206,7 +3243,21 @@ class AsistenteHistologiaQdrant:
                 print(f"  📷 {nombre_archivo} | Etiqueta: {etiqueta or 'N/A'} | Caption: {len(caption)} chars")
                 
                 emb_texto = None
-                texto_relevante = caption if caption else (img_info.get("texto_pagina", "")[:500])
+                # Construir texto enriquecido priorizando etiqueta + título
+                # para que el embedding capture la esencia de la imagen
+                titulo_caption = ""
+                if caption:
+                    titulo_caption = caption.split('\n')[0].strip()
+                partes_emb = []
+                if etiqueta and titulo_caption:
+                    partes_emb.append(f"{etiqueta}: {titulo_caption}")
+                    partes_emb.append(titulo_caption)  # repetir para dar peso
+                elif titulo_caption:
+                    partes_emb.append(titulo_caption)
+                    partes_emb.append(titulo_caption)  # repetir para dar peso
+                if caption:
+                    partes_emb.append(caption[:300])
+                texto_relevante = "\n".join(partes_emb) if partes_emb else (img_info.get("texto_pagina", "")[:500])
                 if texto_relevante:
                     try:
                         emb_texto = self._embed_texto(texto_relevante)
