@@ -14,26 +14,26 @@
         {
             "nodo": "Clasificar",
             "tema_valido": true,
-            "tema_encontrado": "Túnica media",
+            "tema_encontrado": null,
             "entidades": {
                 "tejidos": [],
                 "estructuras": [],
                 "tinciones": []
             },
-            "similitud_dominio": 0.36431432381809814,
-            "metodo_clasificacion": "combinado",
-            "tiempo": 3.22
+            "similitud_dominio": 0.45978271655515257,
+            "metodo_clasificacion": "semantico_imagebind",
+            "tiempo": 1.38
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Estructura de túnica media en arteria muscular.",
-            "tiempo": 0.59
+            "query": "Capas musculares lisas en arterias esofágicas.",
+            "tiempo": 0.94
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 15,
-            "imagenes_para_mostrar": 3,
-            "tiempo": 2.82
+            "imagenes_para_mostrar": 2,
+            "tiempo": 1.88
         },
         {
             "nodo": "FiltrarContexto",
@@ -47,11 +47,11 @@
             "contexto_suficiente": true,
             "imagenes_usadas": 0,
             "tiene_comparativo": false,
-            "tiempo": 1.45
+            "tiempo": 1.53
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 9.25
+            "tiempo_total": 5.75
         }
     ],
     "estructura_identificada": null,
@@ -64,22 +64,13 @@
     "mostrar_imagenes": true,
     "imagenes_para_mostrar": [
         {
-            "id": "7571c5f6-a1e9-52a8-bbd8-7e5ad27a4ca0",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag8.png",
-            "caption": "Imagen 8: corte transversal de una arteria muscular– con láminas elásticas \ninterna y externa\n1. Datos de Identificación y Procedencia\n●\nÓrgano/Tejido/Estructura/Célula: [Timo]\n●\nEspecie: [Mono]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Histomap.ar, IIUA, \nhttp://www.histomap.ar/histoteca/Timo_HE.htm?x=18836&y=14579&z=47]\n2. Panel Fotográfico y Descripciones",
-            "nombre_archivo": "arch3_pag8.png",
-            "etiqueta": "Imagen 8",
-            "fuente": "arch3.pdf",
-            "similitud_semantica": 0.7692303534812075
-        },
-        {
             "id": "07b96be1-123d-5876-9c5d-634f4b2a328c",
             "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag7.png",
             "caption": "Imagen 7: corte oblicuo de una arteria muscular pequeña\n1. Datos de Identificación y Procedencia\n●\nÓrgano/Tejido/Estructura/Célula: [Esófago]\n●\nEspecie: [Humano]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Histomap.ar, IIUA, \nhttp://www.histomap.ar/histoteca/Esofago_HE.htm?x=25471&y=24186&z=27]\n2. Panel Fotográfico y Descripciones",
             "nombre_archivo": "arch3_pag7.png",
             "etiqueta": "Imagen 7",
             "fuente": "arch3.pdf",
-            "similitud_semantica": 0.7601825806958618
+            "similitud_semantica": 0.95
         },
         {
             "id": "3c19c993-a5ab-5fcd-88b3-33334841bb76",
@@ -88,7 +79,16 @@
             "nombre_archivo": "arch3_pag1.png",
             "etiqueta": "Imagen 1",
             "fuente": "arch3.pdf",
-            "similitud_semantica": 0.7490644401623635
+            "similitud_semantica": 0.95
+        },
+        {
+            "id": "a93de4bd-90c9-5896-91e9-e44d971543d7",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag4.png",
+            "caption": "Imagen 4_ Arteria muscular pequeña en corte longitudinal (señalada con \nlínea negra).\nEn la luz de este vaso sanguíneo, se observan eritrocitos y otras células de la sangre. \nRevistiendo la luz, se observan las células endoteliales, en corte longitudinal, con núcleos \nahusados, azul violeta. El músculo liso de la túnica media se dispone en capas \ncircunferenciales numerosas y se identifica por el color rosa de las fibras musculares. Sus \nnúcleos, azul-violeta, están en su mayoría redondeados en ",
+            "nombre_archivo": "arch3_pag4.png",
+            "etiqueta": "Imagen 4",
+            "fuente": "arch3.pdf",
+            "similitud_semantica": 0.95
         }
     ]
 }

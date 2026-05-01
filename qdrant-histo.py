@@ -922,11 +922,13 @@ class QdrantVectorStore:
         UMBRAL_SIMILITUD_IMG = 0.55
         filtrados = [r for r in resultados_rankeados if r["similitud_semantica"] >= UMBRAL_SIMILITUD_IMG]
 
-        # Filtro de coherencia de fuente: si el top resultado tiene una fuente clara,
-        # solo incluir imágenes de otras fuentes si su similitud es prácticamente
-        # igual al top (margen 0.01). Esto evita mezclar imágenes de temas distintos
-        # (ej: arterias de arch3 con espermatogénesis de arch4) cuando el modelo
-        # de embeddings 384d no discrimina bien entre temas histológicos.
+        # Filtro de coherencia de fuente: validar que las imágenes candidatas
+        # provengan de la misma fuente (PDF) que la mayoría de los resultados
+        # de texto. El modelo de embeddings 384d (MiniLM) no discrimina bien
+        # entre subdominios histológicos, causando contaminación cruzada
+        # (ej: arterias de arch3 cuando la consulta es sobre espermatogénesis de arch4).
+        # Usamos las keywords de la consulta (entidades) para inferir la fuente esperada.
+        consulta_keywords = entidades.get("_consulta", [])
         if filtrados and len(filtrados) > 1:
             top_sim = filtrados[0]["similitud_semantica"]
             top_fuente = filtrados[0].get("fuente", "")
@@ -942,6 +944,32 @@ class QdrantVectorStore:
                     if descartadas > 0:
                         print(f"   🔍 Filtro de fuente: descartadas {descartadas} imágenes de otras fuentes")
                     filtrados = coherentes
+
+        # Validación cruzada: si las keywords de la consulta aparecen en los captions
+        # de ciertas imágenes pero NO en otras, descartar las que no contienen keywords.
+        # Esto evita que una imagen de arteria (arch3) aparezca cuando se pregunta
+        # sobre espermatogénesis porque el embedding es genéricamente similar.
+        if filtrados and consulta_keywords and len(filtrados) > 1:
+            import unicodedata
+            def _sin_tildes(s):
+                return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+            kw_lower = [k.lower() for k in consulta_keywords if len(k) > 4]
+            kw_sin_tildes = [_sin_tildes(k) for k in kw_lower]
+            if kw_lower:
+                con_match = []
+                sin_match = []
+                for r in filtrados:
+                    caption_lower = _sin_tildes((r.get("caption", "") or "").lower())
+                    tiene_kw = any(k in caption_lower for k in kw_sin_tildes)
+                    if tiene_kw:
+                        con_match.append(r)
+                    else:
+                        sin_match.append(r)
+                # Si al menos 1 imagen tiene keyword match, descartar las que no
+                if con_match:
+                    if sin_match:
+                        print(f"   🔍 Filtro de keywords: descartadas {len(sin_match)} imágenes sin coincidencia temática")
+                    filtrados = con_match
 
         if filtrados:
             print(f"   ✅ {len(filtrados)} imágenes con similitud semántica >= {UMBRAL_SIMILITUD_IMG}")
@@ -3106,6 +3134,90 @@ class AsistenteHistologiaQdrant:
         except Exception as e:
             print(f"❌ Error: {e}")
             state["respuesta_final"] = f"Error: {e}"
+
+        # ── Post-proceso: extraer "Imagen N" del texto de la respuesta ──
+        # El LLM menciona imágenes por etiqueta ("Imagen 10", "Imagen 21").
+        # Buscamos esas etiquetas EXACTAS en Qdrant para mostrar las correctas,
+        # reemplazando las que se eligieron por búsqueda semántica (menos fiable).
+        # IMPORTANTE: usamos matching exacto de etiqueta (no substring) para
+        # evitar que "Imagen 1" matchee "Imagen 10", "Imagen 11", etc.
+        if state.get("mostrar_imagenes") and state.get("respuesta_final"):
+            try:
+                refs_en_respuesta = re.findall(
+                    r'\*\*(?:Imagen|imagen)\s+(\d+)\*\*|(?:Imagen|imagen)\s+(\d+)',
+                    state["respuesta_final"]
+                )
+                numeros_img = list(dict.fromkeys(
+                    m[0] or m[1] for m in refs_en_respuesta if (m[0] or m[1])
+                ))
+                if numeros_img:
+                    etiquetas_buscadas = {f"imagen {n}" for n in numeros_img}
+                    print(f"   🔍 Extrayendo imágenes mencionadas en respuesta: {[f'Imagen {n}' for n in numeros_img]}")
+
+                    # Determinar fuente dominante de los resultados de texto
+                    # para priorizar imágenes del mismo PDF
+                    fuente_dominante = None
+                    fuentes_count: Dict[str, int] = {}
+                    for r in state.get("resultados_validos", []):
+                        f = r.get("fuente", "")
+                        if f:
+                            fuentes_count[f] = fuentes_count.get(f, 0) + 1
+                    if fuentes_count:
+                        fuente_dominante = max(fuentes_count, key=fuentes_count.get)
+                        print(f"   📄 Fuente dominante de resultados: {fuente_dominante}")
+
+                    # Scroll todas las imágenes y hacer matching EXACTO de etiqueta
+                    all_imgs, _ = self.neo4j.client.scroll(
+                        collection_name=COLLECTION_IMAGENES,
+                        limit=200,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    nuevas_imgs = []
+                    vistas = set()
+                    for r in all_imgs:
+                        etiqueta = (r.payload.get("etiqueta", "") or "").strip().lower()
+                        nombre = (r.payload.get("nombre_archivo", "") or "").lower()
+                        if "_full." in nombre:
+                            continue
+                        # Matching EXACTO: "imagen 1" debe ser == "imagen 1", no substring de "imagen 10"
+                        if etiqueta not in etiquetas_buscadas:
+                            continue
+                        img_path = r.payload.get("path", "")
+                        if not img_path or not os.path.exists(img_path) or img_path in vistas:
+                            continue
+                        vistas.add(img_path)
+                        caption = r.payload.get("caption", "") or ""
+                        nuevas_imgs.append({
+                            "id": str(r.id),
+                            "path": img_path,
+                            "caption": caption[:500],
+                            "nombre_archivo": r.payload.get("nombre_archivo", os.path.basename(img_path)),
+                            "etiqueta": r.payload.get("etiqueta", ""),
+                            "fuente": r.payload.get("fuente", ""),
+                            "similitud_semantica": 0.95,
+                        })
+
+                    # Si hay fuente dominante, priorizar imágenes de esa fuente
+                    if fuente_dominante and nuevas_imgs:
+                        de_fuente = [img for img in nuevas_imgs if img.get("fuente") == fuente_dominante]
+                        de_otra = [img for img in nuevas_imgs if img.get("fuente") != fuente_dominante]
+                        if de_fuente:
+                            nuevas_imgs = de_fuente + de_otra
+                            if de_otra:
+                                print(f"   🔍 Priorizando {len(de_fuente)} imgs de {fuente_dominante} sobre {len(de_otra)} de otras fuentes")
+
+                    # Ordenar por el orden en que aparecen en la respuesta del LLM
+                    orden_numeros = {f"imagen {n}": i for i, n in enumerate(numeros_img)}
+                    nuevas_imgs.sort(key=lambda x: orden_numeros.get(x.get("etiqueta", "").strip().lower(), 999))
+
+                    if nuevas_imgs:
+                        state["imagenes_para_mostrar"] = nuevas_imgs[:3]
+                        print(f"   ✅ Reemplazadas imagenes_para_mostrar con {len(state['imagenes_para_mostrar'])} imgs exactas de la respuesta")
+                        for img in state["imagenes_para_mostrar"]:
+                            print(f"      → {img.get('etiqueta', '')} | {img.get('nombre_archivo', '')} | {img.get('fuente', '')}")
+            except Exception as e:
+                print(f"   ⚠️ Error extrayendo imágenes de la respuesta: {e}")
 
         state["trayectoria"].append({
             "nodo": "GenerarRespuesta", "contexto_suficiente": True,
