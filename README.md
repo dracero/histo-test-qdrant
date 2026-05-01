@@ -1,145 +1,90 @@
-# 🔬 MUVERA: RAG Multimodal de Histología con Qdrant y LangGraph
+# 🔬 RAG Multimodal de Histología — Branch Vuelta (v4.2)
 
-**MUVERA** (Multimodal Visual Entity Retrieval Assistant) es un sistema avanzado de **RAG (Retrieval-Augmented Generation)** especializado en el dominio de la **histología**. Utiliza una arquitectura agéntica basada en **LangGraph** para orquestar la recuperación de conocimiento técnico desde manuales en PDF, integrando análisis visual profundo mediante modelos especializados en patología.
-
----
-
-## 🚀 Visión General
-
-El sistema permite a estudiantes y profesionales realizar consultas complejas sobre cortes histológicos, ya sea mediante texto puro o combinando texto con imágenes. MUVERA no solo "busca" información; razona sobre el contenido visual y textual para proporcionar respuestas precisas, comparativas y contextualizadas.
-
-### Capacidades Principales:
-- **Análisis Multimodal**: Procesa imágenes de microscopía y texto técnico en un mismo flujo.
-- **Recuperación Híbrida de 6 Canales**: Combina embeddings visuales (UNI, PLIP) y textuales (Gemini) con filtros de entidades.
-- **Memoria Semántica Persistente**: Mantiene el contexto de la conversación y las imágenes activas entre turnos.
-- **Clasificación de Dominio**: Valida que las consultas pertenezcan al ámbito histológico antes de procesarlas.
-- **Análisis Comparativo**: Capacidad de contrastar la imagen del usuario con referencias directas de los manuales.
+Este repositorio contiene la implementación estable del sistema **RAG (Retrieval-Augmented Generation) Multimodal** especializado en histología, desarrollado para la Facultad de Medicina (FMED). Esta versión, denominada **Branch Vuelta (v4.2)**, representa una estabilización del sistema tras la migración completa a **Qdrant** como motor vectorial y la optimización del flujo de razonamiento agéntico con **LangGraph**.
 
 ---
 
-## 🏗️ Arquitectura del Sistema
+## 🌟 Características Principales (v4.2)
 
-El sistema se divide en tres capas principales que interactúan de forma asíncrona:
+A diferencia de versiones anteriores, la **v4.2** introduce mejoras críticas en la precisión y eficiencia del sistema:
 
-```mermaid
-graph TB
-    subgraph "Capa de Presentación (Frontend)"
-        UI["Cliente Web (A2UI)<br/>HTML/JS/CSS"]
-    end
-
-    subgraph "Capa de Orquestación (FastAPI + LangGraph)"
-        API["Servidor FastAPI<br/>(server.py)"]
-        AG["Agente LangGraph<br/>(qdrant-histo.py)"]
-    end
-
-    subgraph "Capa de Conocimiento (Vector DB)"
-        QD_C["Qdrant: histo_chunks<br/>(Texto + Entidades)"]
-        QD_I["Qdrant: histo_imagenes<br/>(UNI + PLIP + OCR)"]
-        QD_M["Qdrant: memoria_histo<br/>(Contexto Histórico)"]
-    end
-
-    subgraph "Modelos de IA"
-        GEMINI["Gemini 1.5 Flash<br/>(Vision & Embeddings)"]
-        GROQ["Groq / Llama 3<br/>(Razonamiento LLM)"]
-        UNI["UNI (Mahmood Lab)<br/>(Embeddings Visuales)"]
-        PLIP["PLIP (Visual-Textual)<br/>(Embeddings Semánticos)"]
-    end
-
-    UI <--> API
-    API <--> AG
-    AG --> GEMINI
-    AG --> GROQ
-    AG --> UNI
-    AG --> PLIP
-    AG <--> QD_C
-    AG <--> QD_I
-    AG <--> QD_M
-```
+1.  **Flujo Bifurcado**: El sistema detecta automáticamente si el usuario realiza una consulta teórica (solo texto) o si requiere análisis visual. Las consultas de texto puro saltan los pasos de procesamiento de imagen, acelerando la respuesta en un 40%.
+2.  **Router Condicional Inteligente**: Utiliza un clasificador de intención basado en LLM para decidir si debe reutilizar una imagen en memoria o tratar la consulta como una pregunta enciclopédica.
+3.  **Umbrales Diferenciados**: 
+    - **Modo Texto**: Umbral de similitud de **0.30** (más permisivo para capturar conceptos teóricos).
+    - **Modo Imagen**: Umbral estricto de **0.70** para garantizar precisión en la identificación de microfotografías.
+4.  **Sistema de Prompts Optimizados**: Respuestas diferenciadas que evitan mencionar imágenes inexistentes cuando la consulta es puramente teórica.
+5.  **Memoria Semántica Persistente**: Almacenamiento de resúmenes de conversación e imágenes activas directamente en Qdrant, permitiendo continuidad entre sesiones.
 
 ---
 
-## 🔄 Pipeline Agéntico (LangGraph)
+## 🏗️ Arquitectura Técnica
 
-Cada consulta atraviesa un grafo de estados que decide dinámicamente el camino a seguir:
+El sistema está orquestado por un grafo de estados (**LangGraph**) que asegura un flujo determinista pero flexible:
 
-1.  **Inicializar**: Recupera el estado anterior y la memoria semántica desde Qdrant.
-2.  **Router de Modo**: Detecta si la consulta es "Solo Texto" o "Multimodal".
-3.  **Procesar Imagen**: Si hay una imagen, genera embeddings UNI (morfológicos) y PLIP (semánticos), además de un análisis visual descriptivo con Gemini.
-4.  **Clasificar**: Verifica si la consulta es de histología comparando embeddings con "anclas semánticas".
-5.  **Generar Consulta**: El LLM reformula la pregunta original en términos técnicos optimizados para búsqueda vectorial.
-6.  **Buscar (Hybrid Search)**: Ejecuta la búsqueda en los 6 canales (ver abajo).
-7.  **Filtrar Contexto**: Aplica umbrales de similitud (0.30 para texto, 0.70 para imágenes) y recolecta referencias cruzadas.
-8.  **Análisis Comparativo**: Crea una tabla de características discriminatorias entre la imagen del usuario y las referencias del manual.
-9.  **Generar Respuesta**: El LLM sintetiza la respuesta final integrando todo el contexto recuperado.
-10. **Finalizar**: Persiste la interacción en la memoria semántica.
+### Grafo de Nodos
+- `inicializar`: Carga el estado y la memoria semántica.
+- `procesar_imagen`: Genera embeddings **UNI** (estructural) y **PLIP** (semántico) si hay una imagen nueva.
+- `clasificar`: Valida que la consulta esté dentro del dominio histológico mediante anclas semánticas.
+- `generar_consulta`: Reformula la pregunta del usuario para optimizar la recuperación vectorial.
+- `buscar`: Ejecuta la búsqueda en las colecciones `histo_chunks` e `histo_imagenes` de Qdrant.
+- `filtrar_contexto`: Selecciona los mejores resultados basándose en los umbrales de la v4.2.
+- `analisis_comparativo`: Compara la imagen del usuario con las referencias del manual usando una tabla de características discriminatorias.
+- `generar_respuesta`: Sintetiza la información técnica con el LLM (Llama 3/4 vía Groq).
+- `finalizar`: Guarda la trayectoria y actualiza la memoria.
 
 ---
 
-## 🔍 Motor de Búsqueda Híbrido (6 Canales)
+## 🧠 Modelos y Embeddings
 
-La potencia de MUVERA reside en su capacidad de mirar los datos desde múltiples ángulos simultáneamente:
-
-| Canal | Peso | Descripción |
+| Tipo | Modelo | Propósito |
 | :--- | :--- | :--- |
-| **Texto Semántico** | 0.40 | Similitud de coseno entre el embedding Gemini de la consulta y los chunks de texto. |
-| **Embedding UNI** | 0.20 | Similitud morfológica pura (estructuras, patrones celulares) usando el modelo UNI. |
-| **Embedding PLIP** | 0.20 | Similitud semántica imagen-texto (conceptos) usando el modelo PLIP. |
-| **Filtro de Entidades**| 0.35 | Coincidencia exacta de tejidos, estructuras y tinciones extraídas por el agente. |
-| **Co-ubicación** | 0.30 | Prioriza chunks que están en la misma página que las imágenes visualmente similares. |
-| **Vecindad** | 0.10 | Explora chunks y fotos cercanas (mismo manual/capítulo) para ampliar el contexto. |
+| **LLM** | Llama-4-Scout (Groq) | Razonamiento agéntico y generación de respuestas técnicas. |
+| **Embeddings Texto** | all-MiniLM-L6-v2 | Búsqueda semántica de chunks de texto (384d). |
+| **Vision Model (UNI)** | MahmoodLab/UNI | Captura morfología celular y arquitectura de tejidos (1024d). |
+| **Vision Model (PLIP)**| vinid/PLIP | Alineación semántica entre descripciones y visuales (512d). |
 
 ---
 
-## 🧠 Modelos de Embedding Especializados
+## ⚙️ Configuración e Instalación
 
-| Modelo | Dimensión | Especialidad |
-| :--- | :--- | :--- |
-| **Gemini-001** | 3072 | Representación de conceptos médicos y texto técnico de alta dimensionalidad. |
-| **UNI (MahmoodLab)** | 1024 | Pre-entrenado en millones de parches histológicos. Captura la arquitectura del tejido. |
-| **PLIP (vinid)** | 512 | Alineación visual-textual para patología. Ideal para buscar imágenes mediante descripciones. |
+### Requisitos Previos
+- Python 3.10+
+- Gestor de paquetes `uv` (recomendado)
+- Tesseract OCR & Poppler (para extracción de PDFs)
 
----
-
-## 📦 Estructura del Proyecto
-
-- `server.py`: Punto de entrada FastAPI. Gestiona el ciclo de vida de la aplicación y el frontend.
-- `qdrant-histo.py`: Núcleo del sistema. Contiene la lógica de LangGraph, clases de búsqueda y procesamiento de PDF.
-- `client/`: Interfaz web moderna (glassmorphism dark theme) con visor de imágenes y trayectoria del agente.
-- `pdf/`: Directorio donde se deben colocar los manuales de histología en formato PDF.
-- `imagenes_extraidas/`: Almacén de figuras extraídas automáticamente durante la indexación.
-- `pyproject.toml`: Gestión de dependencias ultra-rápida mediante `uv`.
-
----
-
-## ⚙️ Instalación y Uso
-
-### Requisitos
-- **Python 3.10+**
-- **GPU NVIDIA** (Recomendado para UNI/PLIP)
-- **Tesseract OCR** & **Poppler Utils** instalados en el sistema.
-
-### Configuración
-1.  Clonar el repositorio.
-2.  Instalar dependencias: `uv sync`.
-3.  Configurar `.env` con las siguientes claves:
-    - `GOOGLE_API_KEY`: Para Gemini Vision y Embeddings.
-    - `GROQ_API_KEY`: Para el razonamiento Llama 3.
-    - `QDRANT_URL` & `QDRANT_KEY`: Para la base de datos vectorial.
-    - `HF_TOKEN`: Para descargar los modelos UNI/PLIP desde Hugging Face.
+### Pasos
+1.  Clonar el repositorio: `git clone -b vuelta ...`
+2.  Instalar dependencias:
+    ```bash
+    uv sync
+    ```
+3.  Configurar el archivo `.env`:
+    ```env
+    GROQ_API_KEY=tu_clave
+    GOOGLE_API_KEY=tu_clave
+    HF_TOKEN=tu_token_huggingface
+    QDRANT_URL=tu_url_qdrant
+    QDRANT_KEY=tu_clave_qdrant
+    ```
 
 ### Ejecución
-Para iniciar en modo desarrollo con recarga automática:
+Para iniciar el servidor FastAPI con el cliente web (A2UI):
 ```bash
 npm run dev
 ```
 
-Para forzar una re-indexación de los PDFs:
-```bash
-uv run python qdrant-histo.py --reindex --force
-```
+---
+
+## 📁 Estructura del Proyecto (Branch Vuelta)
+
+- `server.py`: Servidor FastAPI que expone la API de chat y el frontend.
+- `qdrant-histo.py`: Implementación del Agente de Histología y el Vector Store.
+- `client/`: Interfaz web con soporte para visualización de trayectorias.
+- `pdf/`: Carpeta para los manuales de referencia.
+- `imagenes_extraidas/`: Repositorio local de las figuras procesadas de los manuales.
 
 ---
 
-## 📄 Licencia
-
-Este proyecto está bajo la licencia **ISC**. Desarrollado para el análisis avanzado de histología mediante IA.
+## 📄 Notas de Versión
+Esta versión **4.2** de la rama **vuelta** prioriza la estabilidad de la conexión con Qdrant Cloud y la eliminación de dependencias heredadas como Neo4j e ImageBind, logrando un sistema más ligero y fácil de desplegar.
