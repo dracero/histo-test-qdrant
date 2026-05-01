@@ -3,7 +3,7 @@
   "version": "5.0.0",
   "description": "RAG Multimodal de Histología con Qdrant + A2UI",
   "scripts": {
-    "dev": "uv run uvicorn server:app --reload --host 0.0.0.0 --port 10005",
+    "dev": "uv run uvicorn server:app --reload --host 0.0.0.0 --port 10007",
     "start": "uv run python server.py"
   },
   "author": "",

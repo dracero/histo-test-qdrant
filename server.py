@@ -279,7 +279,7 @@ app.mount("/imagenes_extraidas", StaticFiles(directory=str(IMAGENES_DIR)), name=
 
 # ── Main ─────────────────────────────────────────────────────────────
 def main():
-    port = int(os.getenv("PORT", "10005"))
+    port = int(os.getenv("PORT", "10007"))
     print(f"🌐 Servidor en http://localhost:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
 

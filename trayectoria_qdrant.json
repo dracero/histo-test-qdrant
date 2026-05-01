@@ -8,32 +8,32 @@
             "nodo": "Router:_route_por_modo",
             "modo_detectado": "solo_texto",
             "tiene_imagen_nueva": null,
-            "tiene_imagen_memoria": true,
+            "tiene_imagen_memoria": false,
             "hace_referencia_imagen": false
         },
         {
             "nodo": "Clasificar",
             "tema_valido": true,
-            "tema_encontrado": null,
+            "tema_encontrado": "Túnica media",
             "entidades": {
                 "tejidos": [],
                 "estructuras": [],
                 "tinciones": []
             },
-            "similitud_dominio": 0.7231898435818342,
-            "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 2.63
+            "similitud_dominio": 0.36431432381809814,
+            "metodo_clasificacion": "combinado",
+            "tiempo": 3.22
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "¿Qué es la espermatogénesis?",
+            "query": "Estructura de túnica media en arteria muscular.",
             "tiempo": 0.59
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 15,
-            "imagenes_para_mostrar": 0,
-            "tiempo": 1.21
+            "imagenes_para_mostrar": 3,
+            "tiempo": 2.82
         },
         {
             "nodo": "FiltrarContexto",
@@ -47,11 +47,11 @@
             "contexto_suficiente": true,
             "imagenes_usadas": 0,
             "tiene_comparativo": false,
-            "tiempo": 2.16
+            "tiempo": 1.45
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 7.21
+            "tiempo_total": 9.25
         }
     ],
     "estructura_identificada": null,
@@ -61,6 +61,34 @@
         "estructuras": [],
         "tinciones": []
     },
-    "mostrar_imagenes": false,
-    "imagenes_para_mostrar": []
+    "mostrar_imagenes": true,
+    "imagenes_para_mostrar": [
+        {
+            "id": "7571c5f6-a1e9-52a8-bbd8-7e5ad27a4ca0",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag8.png",
+            "caption": "Imagen 8: corte transversal de una arteria muscular– con láminas elásticas \ninterna y externa\n1. Datos de Identificación y Procedencia\n●\nÓrgano/Tejido/Estructura/Célula: [Timo]\n●\nEspecie: [Mono]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Histomap.ar, IIUA, \nhttp://www.histomap.ar/histoteca/Timo_HE.htm?x=18836&y=14579&z=47]\n2. Panel Fotográfico y Descripciones",
+            "nombre_archivo": "arch3_pag8.png",
+            "etiqueta": "Imagen 8",
+            "fuente": "arch3.pdf",
+            "similitud_semantica": 0.7692303534812075
+        },
+        {
+            "id": "07b96be1-123d-5876-9c5d-634f4b2a328c",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag7.png",
+            "caption": "Imagen 7: corte oblicuo de una arteria muscular pequeña\n1. Datos de Identificación y Procedencia\n●\nÓrgano/Tejido/Estructura/Célula: [Esófago]\n●\nEspecie: [Humano]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Histomap.ar, IIUA, \nhttp://www.histomap.ar/histoteca/Esofago_HE.htm?x=25471&y=24186&z=27]\n2. Panel Fotográfico y Descripciones",
+            "nombre_archivo": "arch3_pag7.png",
+            "etiqueta": "Imagen 7",
+            "fuente": "arch3.pdf",
+            "similitud_semantica": 0.7601825806958618
+        },
+        {
+            "id": "3c19c993-a5ab-5fcd-88b3-33334841bb76",
+            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag1.png",
+            "caption": "Imagen 1: Arteria muscular en corte transversal. \n1. Datos de Identificación y Procedencia\n●\nÓrgano: [SD]\n●\nEspecie: [SD]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Base de datos Prof. Ponzio - II UA]\n2. Panel Fotográfico y Descripciones\n●\nFoto 1: Detalle Histológico \nSe observa el contorno ondulado de la luz, con eritrocitos y otras células de la sangre en su \ninterior. El músculo liso se dispone en capas circunferenciales numerosas y se identifica por \nel co",
+            "nombre_archivo": "arch3_pag1.png",
+            "etiqueta": "Imagen 1",
+            "fuente": "arch3.pdf",
+            "similitud_semantica": 0.7490644401623635
+        }
+    ]
 }
