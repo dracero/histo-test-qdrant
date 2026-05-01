@@ -917,10 +917,32 @@ class QdrantVectorStore:
         if resultados_rankeados:
             top3 = [(r["nombre_archivo"], round(r["similitud_semantica"], 3)) for r in resultados_rankeados[:3]]
             print(f"   📊 Re-ranking top-3 sim: {top3}")
-        # Umbral de similitud semántica: 0.45 para garantizar relevancia.
-        # Solo mostramos imágenes que realmente coincidan con la consulta.
-        UMBRAL_SIMILITUD_IMG = 0.45
+
+        # Umbral de similitud semántica: 0.55 para garantizar relevancia.
+        UMBRAL_SIMILITUD_IMG = 0.55
         filtrados = [r for r in resultados_rankeados if r["similitud_semantica"] >= UMBRAL_SIMILITUD_IMG]
+
+        # Filtro de coherencia de fuente: si el top resultado tiene una fuente clara,
+        # solo incluir imágenes de otras fuentes si su similitud es prácticamente
+        # igual al top (margen 0.01). Esto evita mezclar imágenes de temas distintos
+        # (ej: arterias de arch3 con espermatogénesis de arch4) cuando el modelo
+        # de embeddings 384d no discrimina bien entre temas histológicos.
+        if filtrados and len(filtrados) > 1:
+            top_sim = filtrados[0]["similitud_semantica"]
+            top_fuente = filtrados[0].get("fuente", "")
+            if top_fuente:
+                coherentes = []
+                for r in filtrados:
+                    misma_fuente = r.get("fuente", "") == top_fuente
+                    sim_casi_igual = r["similitud_semantica"] >= top_sim - 0.01
+                    if misma_fuente or sim_casi_igual:
+                        coherentes.append(r)
+                if coherentes:
+                    descartadas = len(filtrados) - len(coherentes)
+                    if descartadas > 0:
+                        print(f"   🔍 Filtro de fuente: descartadas {descartadas} imágenes de otras fuentes")
+                    filtrados = coherentes
+
         if filtrados:
             print(f"   ✅ {len(filtrados)} imágenes con similitud semántica >= {UMBRAL_SIMILITUD_IMG}")
         else:
