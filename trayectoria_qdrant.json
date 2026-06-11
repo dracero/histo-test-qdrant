@@ -6,10 +6,16 @@
         },
         {
             "nodo": "Router:_route_por_modo",
-            "modo_detectado": "solo_texto",
-            "tiene_imagen_nueva": null,
+            "modo_detectado": "con_imagen",
+            "tiene_imagen_nueva": true,
             "tiene_imagen_memoria": false,
-            "hace_referencia_imagen": false
+            "hace_referencia_imagen": true
+        },
+        {
+            "nodo": "ProcesarImagen",
+            "tiene_imagen": true,
+            "imagen_es_nueva": true,
+            "tiempo": 2.33
         },
         {
             "nodo": "Clasificar",
@@ -20,75 +26,55 @@
                 "estructuras": [],
                 "tinciones": []
             },
-            "similitud_dominio": 0.45978271655515257,
+            "similitud_dominio": 0.6183859713041018,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 1.38
+            "tiempo": 1.03
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "Capas musculares lisas en arterias esofágicas.",
-            "tiempo": 0.94
+            "query": "Estructura del tejido en la imagen",
+            "tiempo": 0.31
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 15,
-            "imagenes_para_mostrar": 2,
-            "tiempo": 1.88
+            "imagenes_para_mostrar": 0,
+            "tiempo": 2.72
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 10,
-            "imgs": 0,
-            "modo": "solo_texto",
+            "hits_validos": 1,
+            "imgs": 1,
+            "modo": "multimodal",
             "tiempo": 0.0
+        },
+        {
+            "nodo": "AnalisisComparativo",
+            "refs": 1,
+            "estructura": "Imagen 2: Arteria muscular en corte transversal.",
+            "tiempo": 2.88
         },
         {
             "nodo": "GenerarRespuesta",
             "contexto_suficiente": true,
-            "imagenes_usadas": 0,
-            "tiene_comparativo": false,
-            "tiempo": 1.53
+            "imagenes_usadas": 1,
+            "tiene_comparativo": true,
+            "tiempo": 1.84
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 5.75
+            "tiempo_total": 11.13
         }
     ],
-    "estructura_identificada": null,
-    "imagenes_recuperadas": [],
+    "estructura_identificada": "Imagen 2: Arteria muscular en corte transversal.",
+    "imagenes_recuperadas": [
+        "/home/usuario/projects/histo-test-qdrant/imagenes_extraidas/arch3_pag2.png"
+    ],
     "entidades_consulta": {
         "tejidos": [],
         "estructuras": [],
         "tinciones": []
     },
-    "mostrar_imagenes": true,
-    "imagenes_para_mostrar": [
-        {
-            "id": "07b96be1-123d-5876-9c5d-634f4b2a328c",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag7.png",
-            "caption": "Imagen 7: corte oblicuo de una arteria muscular pequeña\n1. Datos de Identificación y Procedencia\n●\nÓrgano/Tejido/Estructura/Célula: [Esófago]\n●\nEspecie: [Humano]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Histomap.ar, IIUA, \nhttp://www.histomap.ar/histoteca/Esofago_HE.htm?x=25471&y=24186&z=27]\n2. Panel Fotográfico y Descripciones",
-            "nombre_archivo": "arch3_pag7.png",
-            "etiqueta": "Imagen 7",
-            "fuente": "arch3.pdf",
-            "similitud_semantica": 0.95
-        },
-        {
-            "id": "3c19c993-a5ab-5fcd-88b3-33334841bb76",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag1.png",
-            "caption": "Imagen 1: Arteria muscular en corte transversal. \n1. Datos de Identificación y Procedencia\n●\nÓrgano: [SD]\n●\nEspecie: [SD]\n●\nTinción/Técnica: [Hematoxilina-Eosina (H&E)]\n●\nProcedencia de las imágenes: [Base de datos Prof. Ponzio - II UA]\n2. Panel Fotográfico y Descripciones\n●\nFoto 1: Detalle Histológico \nSe observa el contorno ondulado de la luz, con eritrocitos y otras células de la sangre en su \ninterior. El músculo liso se dispone en capas circunferenciales numerosas y se identifica por \nel co",
-            "nombre_archivo": "arch3_pag1.png",
-            "etiqueta": "Imagen 1",
-            "fuente": "arch3.pdf",
-            "similitud_semantica": 0.95
-        },
-        {
-            "id": "a93de4bd-90c9-5896-91e9-e44d971543d7",
-            "path": "/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch3_pag4.png",
-            "caption": "Imagen 4_ Arteria muscular pequeña en corte longitudinal (señalada con \nlínea negra).\nEn la luz de este vaso sanguíneo, se observan eritrocitos y otras células de la sangre. \nRevistiendo la luz, se observan las células endoteliales, en corte longitudinal, con núcleos \nahusados, azul violeta. El músculo liso de la túnica media se dispone en capas \ncircunferenciales numerosas y se identifica por el color rosa de las fibras musculares. Sus \nnúcleos, azul-violeta, están en su mayoría redondeados en ",
-            "nombre_archivo": "arch3_pag4.png",
-            "etiqueta": "Imagen 4",
-            "fuente": "arch3.pdf",
-            "similitud_semantica": 0.95
-        }
-    ]
+    "mostrar_imagenes": false,
+    "imagenes_para_mostrar": []
 }
