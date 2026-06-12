@@ -14,3 +14,8 @@ logs/
 # Generated files
 trayectoria_neo4j.json
 temario_histologia.json
+
+# Local storage and chat images
+qdrant_storage/
+imagenes_chat/
+qdrant_memoria/

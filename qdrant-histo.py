@@ -387,10 +387,18 @@ class QdrantVectorStore:
     - Búsqueda (híbrida, vectorial, semántica, etc)
     """
 
-    def __init__(self, url: str, api_key: str):
-        self.url = url
-        self.api_key = api_key
-        self.client = QdrantClient(url=url, api_key=api_key, timeout=60)
+    def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None):
+        self.url = url or userdata.get("QDRANT_URL") or os.getenv("QDRANT_URL")
+        self.api_key = api_key or userdata.get("QDRANT_KEY") or os.getenv("QDRANT_KEY")
+
+        # Sanitizar valores vacíos o None
+        if not self.url or self.url.strip() == "":
+            self.url = None
+        if not self.api_key or self.api_key.strip() == "":
+            self.api_key = None
+
+        target_url = self.url or "http://localhost:6333"
+        self.client = QdrantClient(url=target_url, api_key=self.api_key, timeout=60)
 
     async def connect(self):
         try:
@@ -2732,8 +2740,19 @@ class AsistenteHistologiaQdrant:
         imagenes_texto = state.get("imagenes_texto_map", {})
         for i, ref_path in enumerate(imagenes_ref, 1):
             texto_ref = imagenes_texto.get(ref_path, "Sin descripción disponible")
+            
+            # Extraer etiqueta formal (ej: Imagen 12)
+            etiqueta_formal = ""
+            if texto_ref:
+                primera_linea = texto_ref.split('\n')[0].strip()
+                match = re.match(r'(Imagen\s+\d+[\.]?\d*[A-Za-z]?|Fig(?:ura)?\.?\s*\d+[\.]?\d*[A-Za-z]?)', primera_linea, re.IGNORECASE)
+                if match:
+                    etiqueta_formal = match.group(1).strip()
+            
+            ref_name = etiqueta_formal if etiqueta_formal else f"Imagen de Referencia #{i}"
+            
             content_parts.append({"type": "text", "text": (
-                f"\n=== REFERENCIA #{i} ({os.path.basename(ref_path)}) ===\n"
+                f"\n=== {ref_name} ===\n"
                 f"DESCRIPCIÓN DEL MANUAL: {texto_ref}"
             )})
             try:
@@ -3098,17 +3117,28 @@ class AsistenteHistologiaQdrant:
         # En modo solo texto, el LLM referencia imágenes por etiqueta ("Imagen 15.1")
         # desde el texto de los chunks, y _nodo_finalizar las busca en Qdrant
         if not es_solo_texto:
+            imagenes_texto = state.get("imagenes_texto_map", {})
             for img_path in state.get("imagenes_recuperadas", [])[:3]:
                 if not os.path.exists(img_path):
                     continue
                 try:
+                    # Extraer etiqueta formal (ej: Imagen 12)
+                    texto_ref = imagenes_texto.get(img_path, "")
+                    etiqueta_formal = ""
+                    if texto_ref:
+                        primera_linea = texto_ref.split('\n')[0].strip()
+                        match = re.match(r'(Imagen\s+\d+[\.]?\d*[A-Za-z]?|Fig(?:ura)?\.?\s*\d+[\.]?\d*[A-Za-z]?)', primera_linea, re.IGNORECASE)
+                        if match:
+                            etiqueta_formal = match.group(1).strip()
+                    
+                    nombre_ref = etiqueta_formal if etiqueta_formal else os.path.basename(img_path)
+                    
                     with open(img_path, "rb") as f:
                         data = base64.b64encode(f.read()).decode("utf-8")
                     ext    = os.path.splitext(img_path)[1].lower()
                     mime   = "image/png" if ext == ".png" else "image/jpeg"
-                    nombre = os.path.basename(img_path)
                     content_parts.append({"type": "text",
-                                           "text": f"\n**REFERENCIA [Imagen: {nombre}]:**"})
+                                           "text": f"\n**REFERENCIA [{nombre_ref}]:**"})
                     content_parts.append({"type": "image_url",
                                            "image_url": {"url": f"data:{mime};base64,{data}"}})
                     imagenes_usadas += 1
