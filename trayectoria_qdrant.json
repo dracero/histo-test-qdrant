@@ -6,71 +6,89 @@
         },
         {
             "nodo": "Router:_route_por_modo",
-            "modo_detectado": "solo_texto",
-            "tiene_imagen_nueva": null,
-            "tiene_imagen_memoria": true,
-            "hace_referencia_imagen": false
+            "modo_detectado": "con_imagen",
+            "tiene_imagen_nueva": true,
+            "tiene_imagen_memoria": false,
+            "hace_referencia_imagen": true
+        },
+        {
+            "nodo": "ProcesarImagen",
+            "tiene_imagen": true,
+            "imagen_es_nueva": true,
+            "tiempo": 41.19
         },
         {
             "nodo": "Clasificar",
             "tema_valido": true,
             "tema_encontrado": null,
             "entidades": {
-                "tejidos": [],
-                "estructuras": [],
+                "tejidos": [
+                    "epitelio seminífero",
+                    "tejido intersticial"
+                ],
+                "estructuras": [
+                    "túbulos seminíferos",
+                    "células de sertoli",
+                    "células de la línea germinal"
+                ],
                 "tinciones": []
             },
-            "similitud_dominio": 0.7130792120121456,
+            "similitud_dominio": 0.7770337737107568,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 1.82
+            "tiempo": 50.21
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "espermatozoides en túbulo seminífero testículo.",
-            "tiempo": 0.6
+            "query": "¿Dónde se ubican las células de Sertoli?",
+            "tiempo": 6.09
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 15,
-            "imagenes_para_mostrar": 3,
-            "tiempo": 0.49
+            "imagenes_para_mostrar": 0,
+            "tiempo": 0.05
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 10,
-            "imgs": 0,
-            "modo": "solo_texto",
+            "hits_validos": 1,
+            "imgs": 1,
+            "modo": "multimodal",
             "tiempo": 0.0
+        },
+        {
+            "nodo": "AnalisisComparativo",
+            "refs": 1,
+            "estructura": "Imagen 11",
+            "tiempo": 38.72
         },
         {
             "nodo": "GenerarRespuesta",
             "contexto_suficiente": true,
-            "imagenes_usadas": 0,
-            "tiene_comparativo": false,
-            "tiempo": 1.06
+            "imagenes_usadas": 1,
+            "tiene_comparativo": true,
+            "tiempo": 11.48
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 8.52
+            "tiempo_total": 147.77
         }
     ],
-    "estructura_identificada": null,
-    "imagenes_recuperadas": [],
+    "estructura_identificada": "Imagen 11",
+    "imagenes_recuperadas": [
+        "/run/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch4_pag4.png"
+    ],
     "entidades_consulta": {
-        "tejidos": [],
-        "estructuras": [],
+        "tejidos": [
+            "epitelio seminífero",
+            "tejido intersticial"
+        ],
+        "estructuras": [
+            "túbulos seminíferos",
+            "células de sertoli",
+            "células de la línea germinal"
+        ],
         "tinciones": []
     },
-    "mostrar_imagenes": true,
-    "imagenes_para_mostrar": [
-        {
-            "id": "08d1b7a9-5611-5d57-9c8b-95f113c5f6ec",
-            "path": "/run/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb2/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch4_pag12.png",
-            "caption": "Imagen 19: Espermatozoides\nLos espermatozoides representan el producto final de la espermiogénesis y la \ncélula germinal masculina madura. En los cortes histológicos se observan \npredominantemente en la luz tubular, donde son liberados durante la \nespermiación. Morfológicamente presentan una cabeza oval aplanada con núcleo \nmuy condensado (cromatina intensamente basófila y oscura por la presencia de \nprotaminas), cubierta en su polo anterior por el acrosoma. La pieza intermedia del \nflagelo, ric",
-            "nombre_archivo": "arch4_pag12.png",
-            "etiqueta": "Imagen 19",
-            "fuente": "arch4.pdf",
-            "similitud_semantica": 0.95
-        }
-    ]
+    "mostrar_imagenes": false,
+    "imagenes_para_mostrar": []
 }

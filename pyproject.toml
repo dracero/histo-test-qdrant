@@ -17,8 +17,8 @@ dependencies = [
     # LangSmith observability
     "langsmith>=0.1",
     # ML / Torch
-    "torch==2.7.0",
-    "torchvision==0.22.0",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
     "numpy>=1.24",
     "Pillow>=10.0",
     # Async
@@ -37,6 +37,7 @@ dependencies = [
     "python-multipart>=0.0.6",
     "pymupdf>=1.27.1",
     "langchain-groq>=1.1.2",
+    "langchain-google-genai",
 ]
 
 [tool.setuptools]
@@ -51,11 +52,11 @@ index-url = "https://pypi.org/simple"
 index-strategy = "unsafe-best-match"
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }

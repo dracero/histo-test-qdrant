@@ -62,7 +62,8 @@ from pdf2image import convert_from_path
 import pytesseract
 
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
+from api_key_rotator import google_key_rotator, invoke_with_retry, ainvoke_with_retry, create_google_llm
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from langgraph.graph import StateGraph, START, END
@@ -152,39 +153,87 @@ ANCLAS_SEMANTICAS_HISTOLOGIA = [
 def _safe(value, default: str = "") -> str:
     return value if isinstance(value, str) and value else default
 
-async def invoke_con_reintento(llm, messages, max_retries=5):
+async def invoke_con_reintento(llm, messages, max_retries=None):
     import asyncio
-    for attempt in range(max_retries):
+    from api_key_rotator import google_key_rotator, _is_quota_error, _rebuild_llm
+    if max_retries is None:
+        max_retries = max(google_key_rotator.total_keys, 1)
+
+    current_key = getattr(llm, "google_api_key", "")
+    if hasattr(current_key, "get_secret_value"):
+        current_key = current_key.get_secret_value()
+
+    for attempt in range(max_retries + 1):
         try:
             return await llm.ainvoke(messages)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
-                if attempt < max_retries - 1:
-                    espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
-                    await asyncio.sleep(espera)
-                else:
-                    raise e
-            else:
-                raise e
+        except Exception as exc:
+            if not _is_quota_error(exc):
+                raise exc
+            print(f"⚠️ [Async Retry {attempt+1}/{max_retries}] Cuota excedida con key ...{current_key[-4:] if current_key else '????'}: {str(exc)[:200]}")
+            if attempt >= max_retries:
+                raise exc
+            if current_key:
+                google_key_rotator.report_failure(current_key)
+            new_key = google_key_rotator.get_key()
+            
+            # Actualizar in-place recreando los clientes para no perder la referencia original
+            new_llm = _rebuild_llm(llm, new_key)
+            # Guardamos una referencia fuerte para evitar que el garbage collector cierre los clientes
+            llm._strong_ref = getattr(llm, "_strong_ref", []) + [new_llm]
+            
+            llm.google_api_key = new_llm.google_api_key
+            for attr in ["client", "_client", "_genai_client", "async_client"]:
+                if hasattr(new_llm, attr):
+                    try:
+                        setattr(llm, attr, getattr(new_llm, attr))
+                    except:
+                        pass
+            
+            current_key = new_key
+            wait = 2.0 * (2 ** attempt)
+            print(f"⏳ Esperando {wait:.1f}s antes de reintentar...")
+            await asyncio.sleep(wait)
 
-def invoke_con_reintento_sync(llm, messages, max_retries=5):
+def invoke_con_reintento_sync(llm, messages, max_retries=None):
     import time
-    for attempt in range(max_retries):
+    from api_key_rotator import google_key_rotator, _is_quota_error, _rebuild_llm
+    if max_retries is None:
+        max_retries = max(google_key_rotator.total_keys, 1)
+
+    current_key = getattr(llm, "google_api_key", "")
+    if hasattr(current_key, "get_secret_value"):
+        current_key = current_key.get_secret_value()
+
+    for attempt in range(max_retries + 1):
         try:
             return llm.invoke(messages)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
-                if attempt < max_retries - 1:
-                    espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
-                    time.sleep(espera)
-                else:
-                    raise e
-            else:
-                raise e
+        except Exception as exc:
+            if not _is_quota_error(exc):
+                raise exc
+            print(f"⚠️ [Sync Retry {attempt+1}/{max_retries}] Cuota excedida con key ...{current_key[-4:] if current_key else '????'}: {str(exc)[:200]}")
+            if attempt >= max_retries:
+                raise exc
+            if current_key:
+                google_key_rotator.report_failure(current_key)
+            new_key = google_key_rotator.get_key()
+            
+            # Actualizar in-place recreando los clientes para no perder la referencia original
+            new_llm = _rebuild_llm(llm, new_key)
+            # Guardamos una referencia fuerte para evitar que el garbage collector cierre los clientes
+            llm._strong_ref = getattr(llm, "_strong_ref", []) + [new_llm]
+            
+            llm.google_api_key = new_llm.google_api_key
+            for attr in ["client", "_client", "_genai_client", "async_client"]:
+                if hasattr(new_llm, attr):
+                    try:
+                        setattr(llm, attr, getattr(new_llm, attr))
+                    except:
+                        pass
+            
+            current_key = new_key
+            wait = 2.0 * (2 ** attempt)
+            print(f"⏳ Esperando {wait:.1f}s antes de reintentar...")
+            time.sleep(wait)
 
 def embed_query_con_reintento(embeddings, texto: str, max_retries=5):
     import time
@@ -1960,8 +2009,11 @@ class AsistenteHistologiaQdrant:
         if self.device == "cuda":
             try:
                 cap = torch.cuda.get_device_capability(0)
-                if cap[0] < 7:
-                    print(f"⚠️ GPU incompatible detectada (sm_{cap[0]}{cap[1]}). Forzando CPU para evitar fallback_error.")
+                arch_list = torch.cuda.get_arch_list()
+                gpu_arch = f"sm_{cap[0]}{cap[1]}"
+                gpu_arch_base = f"sm_{cap[0]}0"
+                if gpu_arch not in arch_list and gpu_arch_base not in arch_list:
+                    print(f"⚠️ GPU incompatible detectada ({gpu_arch}). Forzando CPU para evitar fallback_error.")
                     self.device = "cpu"
             except:
                 pass
@@ -2005,12 +2057,21 @@ class AsistenteHistologiaQdrant:
         print("✅ Todos los componentes inicializados")
 
     def _init_modelos(self):
-        self.llm = ChatGroq(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            api_key=userdata.get("GROQ_API_KEY"),
-            temperature=0, max_retries=1
+        google_key_rotator.load_keys()
+        
+        self.llm = create_google_llm(
+            model="gemini-2.5-flash",
+            temperature=0.0,
+            rotator=google_key_rotator
         )
-        print("✅ Groq inicializado")
+        print("✅ Gemini (llm) inicializado con key rotativa")
+        
+        self.llm_vision = create_google_llm(
+            model="gemini-2.5-flash",
+            temperature=0.0,
+            rotator=google_key_rotator
+        )
+        print("✅ Gemini Vision (llm_vision) inicializado con key rotativa")
         
         # Inicializar Embeddings (HuggingFace)
         self.embeddings = HuggingFaceEmbeddings(
@@ -2378,7 +2439,7 @@ class AsistenteHistologiaQdrant:
                 )},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
             ])
-            resp = await invoke_con_reintento(self.llm, [msg])
+            resp = await invoke_con_reintento(self.llm_vision, [msg])
             return resp.content
         except Exception as e:
             print(f"⚠️ Error describiendo imagen: {e}")
@@ -2784,7 +2845,7 @@ class AsistenteHistologiaQdrant:
         )})
 
         try:
-            resp = await invoke_con_reintento(self.llm, [HumanMessage(content=content_parts)])
+            resp = await invoke_con_reintento(self.llm_vision, [HumanMessage(content=content_parts)])
             state["analisis_comparativo"] = resp.content
             print(f"✅ Análisis comparativo: {len(resp.content)} chars")
         except Exception as e:
@@ -3148,10 +3209,18 @@ class AsistenteHistologiaQdrant:
         print(f"   📊 {1 if state.get('tiene_imagen') else 0} usuario + {imagenes_usadas} manual")
 
         try:
-            resp = await invoke_con_reintento(self.llm, [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=content_parts)
-            ])
+            if es_solo_texto:
+                # Si es solo texto, enviamos como string simple para evitar error en modelos no vision
+                text_content = "".join(part["text"] for part in content_parts if part["type"] == "text")
+                resp = await invoke_con_reintento(self.llm, [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=text_content)
+                ])
+            else:
+                resp = await invoke_con_reintento(self.llm_vision, [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=content_parts)
+                ])
             if state.get("confianza_baja"):
                 warning = "⚠️ *Nota: Esta respuesta se generó con confianza baja (<71% de coincidencia) en los apuntes, tómalo en cuenta.*"
                 if "Hola, ¿en qué te puedo ayudar sobre histología?" in resp.content:
