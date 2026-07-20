@@ -6,16 +6,10 @@
         },
         {
             "nodo": "Router:_route_por_modo",
-            "modo_detectado": "con_imagen",
-            "tiene_imagen_nueva": true,
-            "tiene_imagen_memoria": false,
-            "hace_referencia_imagen": true
-        },
-        {
-            "nodo": "ProcesarImagen",
-            "tiene_imagen": true,
-            "imagen_es_nueva": true,
-            "tiempo": 41.19
+            "modo_detectado": "solo_texto",
+            "tiene_imagen_nueva": null,
+            "tiene_imagen_memoria": true,
+            "hace_referencia_imagen": false
         },
         {
             "nodo": "Clasificar",
@@ -23,69 +17,57 @@
             "tema_encontrado": null,
             "entidades": {
                 "tejidos": [
-                    "epitelio seminífero",
-                    "tejido intersticial"
+                    "epitelio seminífero"
                 ],
                 "estructuras": [
-                    "túbulos seminíferos",
-                    "células de sertoli",
-                    "células de la línea germinal"
+                    "zona basal",
+                    "epitelio seminífero"
                 ],
                 "tinciones": []
             },
-            "similitud_dominio": 0.7770337737107568,
+            "similitud_dominio": 0.8699340105554857,
             "metodo_clasificacion": "semantico_imagebind",
-            "tiempo": 50.21
+            "tiempo": 8.71
         },
         {
             "nodo": "GenerarConsulta",
-            "query": "¿Dónde se ubican las células de Sertoli?",
-            "tiempo": 6.09
+            "query": "¿Qué es el epitelio seminífero?",
+            "tiempo": 24.04
         },
         {
             "nodo": "BuscarNeo4j",
             "hits": 15,
             "imagenes_para_mostrar": 0,
-            "tiempo": 0.05
+            "tiempo": 0.04
         },
         {
             "nodo": "FiltrarContexto",
-            "hits_validos": 1,
-            "imgs": 1,
-            "modo": "multimodal",
+            "hits_validos": 10,
+            "imgs": 0,
+            "modo": "solo_texto",
             "tiempo": 0.0
-        },
-        {
-            "nodo": "AnalisisComparativo",
-            "refs": 1,
-            "estructura": "Imagen 11",
-            "tiempo": 38.72
         },
         {
             "nodo": "GenerarRespuesta",
             "contexto_suficiente": true,
-            "imagenes_usadas": 1,
-            "tiene_comparativo": true,
-            "tiempo": 11.48
+            "imagenes_usadas": 0,
+            "tiene_comparativo": false,
+            "tiempo": 6.0
         },
         {
             "nodo": "Finalizar",
-            "tiempo_total": 147.77
+            "tiempo_total": 40.64
         }
     ],
-    "estructura_identificada": "Imagen 11",
-    "imagenes_recuperadas": [
-        "/run/media/dracero/08c67654-6ed7-4725-b74e-50f29ea60cb21/pythonAI-Others/histo-test-qdrant/imagenes_extraidas/arch4_pag4.png"
-    ],
+    "estructura_identificada": null,
+    "imagenes_recuperadas": [],
     "entidades_consulta": {
         "tejidos": [
-            "epitelio seminífero",
-            "tejido intersticial"
+            "epitelio seminífero"
         ],
         "estructuras": [
-            "túbulos seminíferos",
-            "células de sertoli",
-            "células de la línea germinal"
+            "zona basal",
+            "epitelio seminífero"
         ],
         "tinciones": []
     },
